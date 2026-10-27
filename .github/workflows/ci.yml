@@ -1,0 +1,131 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo x setup
+      - run: cargo x lint
+      - run: cargo x test
+
+  # One bundle with every target. The Darwin target needs a Mac, and the Mac cross-builds the
+  # Linux (zig) and Windows (MinGW) targets.
+  bundle:
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check that the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          crate=$(grep -m 1 '^version = ' crates/iroh-mesh-cli/Cargo.toml | cut -d '"' -f 2)
+          [ "${GITHUB_REF_NAME#v}" = "$crate" ] || { echo "tag $GITHUB_REF_NAME does not match iroh-mesh-cli $crate"; exit 1; }
+      - run: brew install cargo-zigbuild
+      - run: cargo x tools
+      - run: cargo x build
+      - name: Check the npm size limit
+        run: |
+          size=$(stat -f %z dist/imesh.zip)
+          echo "imesh.zip is $size bytes"
+          [ "$size" -lt 95000000 ] || { echo "imesh.zip is too large for one npm package"; exit 1; }
+      - name: Archive the binaries
+        run: |
+          mkdir -p release
+          for d in dist/imesh/targets/*; do
+            t=$(basename "$d")
+            if [ -f "$d/imesh.exe" ]; then
+              (cd "$d" && zip -q "$OLDPWD/release/imesh-$t.zip" imesh.exe)
+            else
+              tar -C "$d" -czf "release/imesh-$t.tar.gz" imesh
+            fi
+          done
+          cp dist/imesh.zip release/imesh-bundle.zip
+          cd release && for f in *; do shasum -a 256 "$f" | awk '{print $1}' > "$f.sha256"; done
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/imesh.zip
+            dist/imesh/manifest.json
+            dist/imesh/targets
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+
+  npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing (OIDC) needs npm 11.5.1 or later. No token is stored.
+      - run: npm install -g npm@latest
+      - name: Make packages
+        run: node npm/scripts/pack.mjs "${GITHUB_REF_NAME#v}" dist out
+      - name: Publish
+        # Each package trusts this repository and ci.yml on npmjs.com, so npm takes the
+        # GitHub OIDC token and adds provenance. A package that a failed run already published
+        # is skipped, so the tag can run again.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for d in out/iroh-mesh-* out/iroh-mesh; do
+            name=$(node -p "require('./$d/package.json').name")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published"
+            else
+              npm publish "$d" --access public
+            fi
+          done

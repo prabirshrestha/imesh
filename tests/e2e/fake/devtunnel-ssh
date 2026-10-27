@@ -1,0 +1,46 @@
+#!/bin/sh
+# A stand-in for Microsoft's devtunnel CLI on the operator's computer, for tests/e2e/linux.sh
+# stage 25. `connect` forwards the tunnel's one SSH port to a container's SSH server, as a
+# private devtunnel to a remote computer would. FAKE_DT_TARGET is host:port of that server.
+# FAKE_DT_STATE records every connect, so the test can see that each SSH session started its own.
+S=${FAKE_DT_STATE:-/tmp/fake-devtunnel-ssh}
+mkdir -p "$S"
+case "$1" in
+--version) echo "Tunnel CLI version: fake" ;;
+user) echo '{"status":"Logged in","provider":"fake","username":"tester"}' ;;
+show)
+	case $(cat "$S/access" 2>/dev/null) in
+	anonymous) printf '{"tunnel":{"tunnelId":"%s","accessControl":{"entries":[{"type":"Anonymous"}]},"ports":[{"portNumber":%s}]}}' "$2" "$FAKE_DT_PORT" ;;
+	*) printf '{"tunnel":{"tunnelId":"%s","ports":[{"portNumber":%s}]}}' "$2" "$FAKE_DT_PORT" ;;
+	esac ;;
+connect)
+	echo "$$" >>"$S/connects"
+	exec python3 -u -c '
+import socket, sys, threading
+port, target = int(sys.argv[1]), sys.argv[2]
+host, tport = target.rsplit(":", 1)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try: srv.bind(("127.0.0.1", port))
+except OSError: srv.bind(("127.0.0.1", 0))
+port = srv.getsockname()[1]
+srv.listen(8)
+print("Connected to tunnel: fake", flush=True)
+print("SSH: PortForwardingService listening on 127.0.0.1:%d." % port, flush=True)
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d: break
+            b.sendall(d)
+    except OSError: pass
+    finally:
+        try: b.shutdown(socket.SHUT_WR)
+        except OSError: pass
+while True:
+    c, _ = srv.accept()
+    u = socket.create_connection((host, int(tport)))
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+' "$FAKE_DT_PORT" "$FAKE_DT_TARGET" ;;
+*) echo "fake devtunnel: unknown command $*" >&2; exit 1 ;;
+esac

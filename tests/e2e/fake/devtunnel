@@ -1,0 +1,110 @@
+#!/bin/sh
+# A stand-in for Microsoft's devtunnel CLI, for the e2e tests. It answers the commands imesh runs.
+# No Microsoft account or external tunnel service is used.
+#
+# Each machine hosts its own tunnels. The tunnels are a map in a directory that every container
+# mounts at /dt. Without /dt, the map is local to the machine, and `connect` to a tunnel that is
+# not in it goes to fake-relay:3341 with port 3340, as stage 22 of linux.sh expects.
+# The map:
+#   t/<id>/labels   one label per line
+#   t/<id>/port     the tunnel port
+#   t/<id>/addr     <container ip>:3341, while `devtunnel host` runs there
+#   t/<id>/host     the hostname of that container; t/<id>/pid the host process
+#   log             one line for each `connect`: "<hostname> connect <id>"
+# `host` listens on 3341 and forwards to 127.0.0.1:<port>. `connect` listens on
+# 127.0.0.1:<port> and forwards to the address of the host. The files of one machine only
+# (create-args, hosting, connecting, connecting-<id>, forwarder-<id>) stay in $STATE_DIRECTORY/fake-devtunnel.
+umask 000
+S=${STATE_DIRECTORY:-/tmp}/fake-devtunnel
+D=/dt
+[ -d "$D" ] || D=$S
+mkdir -p "$S" "$D/t"
+HOSTPORT=3341
+t() { echo "$D/t/$1"; }
+need() { [ -d "$(t "$1")" ] || { echo "fake devtunnel: tunnel $1 not found" >&2; exit 1; }; }
+if [ "$1" = show ] || [ "$1" = connect ]; then
+	if [ ! -d "$(t "$2")" ] && [ "$D" = "$S" ]; then
+		mkdir -p "$(t "$2")"
+		echo 3340 >"$(t "$2")/port"
+		echo fake-relay:$HOSTPORT >"$(t "$2")/addr"
+		echo fake-relay >"$(t "$2")/host"
+		: >"$(t "$2")/labels"
+	fi
+fi
+case "$1" in
+list)
+	shift
+	want=
+	while [ $# -gt 0 ]; do
+		case "$1" in --all-labels) want="$want $2"; shift 2 ;; *) shift ;; esac
+	done
+	ids=
+	for dir in "$D"/t/*/; do
+		[ -d "$dir" ] || continue
+		ok=1
+		for l in $want; do grep -qx "$l" "$dir/labels" 2>/dev/null || ok=; done
+		[ -n "$ok" ] && ids="$ids $(basename "$dir")"
+	done
+	printf '{"tunnels":[%s]}' "$(for i in $ids; do printf '{"tunnelId":"%s"}\n' "$i"; done | paste -sd, -)" ;;
+create)
+	echo "$*" >"$S/create-args"
+	shift
+	case "$1" in -*|"") id=fake-tunnel ;; *) id=$1; shift ;; esac
+	mkdir -p "$(t "$id")"
+	: >"$(t "$id")/labels"
+	while [ $# -gt 0 ]; do
+		case "$1" in -l) echo "$2" >>"$(t "$id")/labels"; shift 2 ;; *) shift ;; esac
+	done
+	printf '{"tunnel":{"tunnelId":"%s"}}' "$id" ;;
+show)
+	need "$2"
+	dir=$(t "$2")
+	ports=
+	[ -f "$dir/port" ] && ports="{\"portNumber\":$(cat "$dir/port")}"
+	hosts=0
+	if [ -f "$dir/addr" ]; then
+		if [ "$(cat "$dir/host")" = "$(hostname)" ]; then
+			# A stopped host (SIGSTOP) has lost the service, as a real host can.
+			state=$(ps -o stat= -p "$(cat "$dir/pid")" 2>/dev/null)
+			case "$state" in "" | T*) ;; *) hosts=1 ;; esac
+		else
+			socat -u OPEN:/dev/null "TCP:$(cat "$dir/addr"),connect-timeout=2" 2>/dev/null && hosts=1
+		fi
+	fi
+	labels=$(sed 's/.*/"&"/' "$dir/labels" | paste -sd, -)
+	printf '{"tunnel":{"tunnelId":"%s","hostConnections":%s,"labels":[%s],"ports":[%s]}}' "$2" "$hosts" "$labels" "$ports" ;;
+port)
+	# port create <tunnel> -p <port> --protocol http
+	need "$3"
+	echo "$5" >"$(t "$3")/port" ;;
+host)
+	need "$2"
+	dir=$(t "$2")
+	echo $$ >"$S/hosting"
+	echo $$ >"$dir/pid"
+	hostname >"$dir/host"
+	echo "$(hostname -i | awk '{print $1}'):$HOSTPORT" >"$dir/addr"
+	echo "Ready to accept connections for tunnel: $2"
+	exec socat "TCP-LISTEN:$HOSTPORT,reuseaddr,fork" "TCP:127.0.0.1:$(cat "$dir/port")" ;;
+connect)
+	need "$2"
+	dir=$(t "$2")
+	[ -f "$dir/addr" ] || { echo "fake devtunnel: tunnel $2 has no host" >&2; exit 1; }
+	port=$(cat "$dir/port")
+	echo $$ >"$S/connecting"
+	echo $$ >"$S/connecting-$2"
+	echo "$(hostname) connect $2" >>"$D/log"
+	echo "Connected to tunnel: $2"
+	echo "SSH: PortForwardingService listening on 127.0.0.1:$port."
+	# The forwarder is a child, so killing it (pid in "forwarder") leaves a connect that runs
+	# but no longer forwards, as a real one can. It dies with this process.
+	setpriv --pdeathsig KILL socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "TCP:$(cat "$dir/addr")" &
+	echo $! >"$S/forwarder-$2"
+	while :; do sleep 3600; done ;;
+delete)
+	need "$2"
+	rm -rf "$(t "$2")"
+	echo "Deleted tunnel: $2" ;;
+*)
+	echo "fake devtunnel: unknown command $*" >&2; exit 1 ;;
+esac

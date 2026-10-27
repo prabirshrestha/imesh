@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/iroh-mesh", "crates/iroh-mesh-cli"]
+exclude = ["vendor", "xtask"]
+
+# Corrosion's workspace patches quinn; patches do not travel with git dependencies.
+[patch.crates-io]
+quinn = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
+quinn-proto = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
+quinn-udp = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
+
+# Corrosion with imesh's fixes: a submodule plus vendor/corrosion.patch (run `cargo x setup`).
+[patch."https://github.com/superfly/corrosion"]
+corro-agent = { path = "vendor/corrosion/crates/corro-agent" }
+corro-types = { path = "vendor/corrosion/crates/corro-types" }
+tripwire = { path = "vendor/corrosion/crates/tripwire" }
+
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
