@@ -1,0 +1,4 @@
+[alias]
+# Project tasks: `cargo x help`. The task runner is its own package, outside the workspace, so it
+# runs before the Corrosion submodule exists.
+x = "run -q --manifest-path xtask/Cargo.toml --"

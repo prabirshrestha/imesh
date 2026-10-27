@@ -1,0 +1,40 @@
+#!/bin/sh
+# A stand-in for Microsoft's devtunnel CLI, for tests/e2e/linux.sh stage 22. It answers the
+# commands imesh runs and forwards a private relay between two containers with socat.
+# No Microsoft account or external tunnel service is used.
+S=${STATE_DIRECTORY:-/tmp}/fake-devtunnel
+mkdir -p "$S"
+id() { cat "$S/id"; }
+case "$1" in
+list)
+	if [ -f "$S/id" ]; then printf '{"tunnels":[{"tunnelId":"%s"}]}' "$(id)"; else echo '{"tunnels":[]}'; fi ;;
+create)
+	echo "$*" >"$S/create-args"
+	case "$2" in -*|"") echo fake-tunnel >"$S/id" ;; *) echo "$2" >"$S/id" ;; esac
+	printf '{"tunnel":{"tunnelId":"%s"}}' "$(id)" ;;
+show)
+	[ -f "$S/id" ] || { echo '{"tunnel":{"tunnelId":"fake-tunnel","ports":[{"portNumber":3340}]}}'; exit 0; }
+	ports=
+	if [ -f "$S/port" ]; then
+		uri=
+		if [ -f "$S/hosting" ] && kill -0 "$(cat "$S/hosting")" 2>/dev/null; then
+			uri=",\"portUri\":\"http://$(hostname -i | awk '{print $1}'):$(cat "$S/port")/\""
+		fi
+		ports="{\"portNumber\":$(cat "$S/port")$uri}"
+	fi
+	printf '{"tunnel":{"tunnelId":"%s","ports":[%s]}}' "$(id)" "$ports" ;;
+port)
+	# port create <tunnel> -p <port> --protocol http
+	echo "$5" >"$S/port" ;;
+host)
+	echo $$ >"$S/hosting"
+	echo 'Ready to accept connections for tunnel: fake-tunnel'
+	exec socat TCP-LISTEN:3341,reuseaddr,fork TCP:127.0.0.1:3340 ;;
+connect)
+	echo $$ >"$S/connecting"
+	echo 'Connected to tunnel: fake-tunnel'
+	echo 'SSH: PortForwardingService listening on 127.0.0.1:3340.'
+	exec socat TCP-LISTEN:3340,bind=127.0.0.1,reuseaddr,fork TCP:fake-relay:3341 ;;
+*)
+	echo "fake devtunnel: unknown command $*" >&2; exit 1 ;;
+esac

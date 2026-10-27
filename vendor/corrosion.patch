@@ -1,0 +1,94 @@
+diff --git a/crates/corro-pg/Cargo.toml b/crates/corro-pg/Cargo.toml
+index 663c7eba..d5e35db5 100644
+--- a/crates/corro-pg/Cargo.toml
++++ b/crates/corro-pg/Cargo.toml
+@@ -20,7 +20,7 @@ hex = { workspace = true }
+ itertools = { workspace = true }
+ metrics = { workspace = true }
+ parking_lot.workspace = true
+-pgwire = { version = "0.37", default-features = false, features = ["server-api-ring", "server-api", "client-api", "pg-type-chrono"] }
++pgwire = { version = "0.37", default-features = false, features = ["server-api-ring", "server-api", "pg-type-chrono"] }
+ pin-project-lite.workspace = true
+ postgres-types = { version = "0.2", features = ["with-time-0_3"] }
+ rand = { workspace = true }
+diff --git a/crates/corro-types/src/sqlite.rs b/crates/corro-types/src/sqlite.rs
+index 4d7ee1d5..aff01d9c 100644
+--- a/crates/corro-types/src/sqlite.rs
++++ b/crates/corro-types/src/sqlite.rs
+@@ -353,7 +353,12 @@ pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
+ #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+ pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
+ 
+-// TODO: support windows
++// Windows has no bundled build. The host program must serve `crsqlite` itself, as imesh does
++// with a statically linked copy behind its own SQLite VFS.
++#[cfg(windows)]
++pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dll";
++#[cfg(windows)]
++pub const CRSQL_EXT: &[u8] = &[];
+ 
+ // need to keep this alive!
+ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
+@@ -454,12 +459,13 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+ }
+ 
+ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+-    // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
++    // WAL journal mode, and synchronous FULL (imesh): a committed write survives a power loss,
++    // not only a crash of the process.
+     conn.execute_batch(
+         r#"
+             PRAGMA journal_mode = WAL;
+             PRAGMA journal_size_limit = 1073741824;
+-            PRAGMA synchronous = NORMAL;
++            PRAGMA synchronous = FULL;
+             PRAGMA recursive_triggers = ON;
+             PRAGMA mmap_size = 8589934592; -- 8GB
+         "#,
+diff --git a/crates/tripwire/src/lib.rs b/crates/tripwire/src/lib.rs
+index 62a457d4..8800aae3 100644
+--- a/crates/tripwire/src/lib.rs
++++ b/crates/tripwire/src/lib.rs
+@@ -5,6 +5,7 @@
+ #![deny(clippy::await_holding_lock)]
+ 
+ mod preempt;
++#[cfg(unix)]
+ mod signalstream;
+ mod tripwire;
+ 
+diff --git a/crates/tripwire/src/tripwire.rs b/crates/tripwire/src/tripwire.rs
+index 264a936f..7c9da23e 100644
+--- a/crates/tripwire/src/tripwire.rs
++++ b/crates/tripwire/src/tripwire.rs
+@@ -1,17 +1,18 @@
+ use futures::stream::Stream;
++#[cfg(unix)]
+ use futures_util::stream::{select, Select};
+ use std::{
+     future::Future,
+     pin::Pin,
+     task::{Context, Poll},
+ };
+-use tokio::{
+-    signal::unix::{signal, SignalKind},
+-    sync::{mpsc, watch},
+-};
++#[cfg(unix)]
++use tokio::signal::unix::{signal, SignalKind};
++use tokio::sync::{mpsc, watch};
+ use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+ use tracing::{debug, warn};
+ 
++#[cfg(unix)]
+ use crate::signalstream::SignalStream;
+ 
+ /// A `Future` that completes once the program is requested to shutdown. This
+@@ -51,6 +52,7 @@ impl Tripwire {
+     }
+ 
+     /// Listen for SIGTERM and SIGINT
++    #[cfg(unix)]
+     pub fn new_signals() -> (Self, TripwireWorker<Select<SignalStream, SignalStream>>) {
+         let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
+         let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());

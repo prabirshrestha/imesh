@@ -1,0 +1,26 @@
+{
+  "name": "imesh",
+  "version": "0.1.0",
+  "description": "A cluster of equal machines over iroh, with one replicated SQLite database",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prabirshrestha/imesh.git"
+  },
+  "bin": {
+    "imesh": "bin/imesh.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "imesh-darwin-arm64": "0.1.0",
+    "imesh-darwin-x64": "0.1.0",
+    "imesh-linux-arm64": "0.1.0",
+    "imesh-linux-x64": "0.1.0",
+    "imesh-win32-arm64": "0.1.0",
+    "imesh-win32-x64": "0.1.0"
+  }
+}

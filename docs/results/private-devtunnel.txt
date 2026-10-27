@@ -1,0 +1,39 @@
+Private devtunnel CLI forwarding, 2026-09-25 UTC
+
+Original imesh tunnels deleted:
+  silent-dog-mh31gxp.use
+  silent-fog-045m88j.usw3
+Both work machines: imesh install, settings, key, database, proof files, uploaded
+binaries, service/task and imesh Windows PATH entry removed.
+Dev tunnel CLI login and SSH configuration retained.
+
+Temporary private CLI test:
+  Tunnel accessControl: []
+  Unauthenticated HTTPS request: 302 login redirect
+  Logged-in CLI loopback request: 200
+  Library example: HTTP/1.0 200 OK
+  Library example: PASS forwarding and child cleanup
+  Temporary tunnel and host/HTTP service removed after test.
+
+Full Docker suite attempted: passed through stage 20 update and reset checks.
+Stopped on existing group socket access timeout. Docker became unresponsive
+in cleanup; repeat run blocked at docker info. Revised private stage 22 not run.
+
+Final unit tests: 17 passed. Lint: PASS.
+Final Windows clippy and release build: PASS.
+
+Adversarial review follow-up:
+  Fixed host readiness, library ID validation, conflicting update settings,
+  the Windows host tunnel ID, and the HTTP example success check.
+  Retry delays: 1, 2, 4, 8, 16, 32, 60 seconds, capped indefinitely.
+  Delay resets after a ready child runs for 60 seconds.
+  cargo x test: PASS, 19 tests.
+  cargo x lint: PASS.
+  cargo x windows: PASS, clippy and release binaries.
+  Shell syntax and git diff --check: PASS.
+  Full e2e PREFIX=review PORTS=31: stages 1 through 14 passed, then stalled
+  during stage 15 initialization. docker ps and docker exec true timed out.
+  Test runner stopped. Container cleanup then failed because Docker's socket
+  was unavailable. Test containers may remain when Docker starts again.
+  Final review edits and private stage 22 still need a full e2e run.
+  The user approved commit and push with the required end-to-end check incomplete.

@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Project tasks for imesh: cargo x <task>"
+
+[dependencies]
+
+[workspace]

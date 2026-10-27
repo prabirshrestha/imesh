@@ -1,0 +1,14 @@
+== W1. a Linux cluster over SSH
+PASS lin1 and lin2
+== W2. the Windows machine installs itself, with no admin and no SSH in imesh
+PASS daemon installed as a scheduled task, ticket printed
+== W3. admit by ticket on this computer, join on Windows
+PASS win01 joined with tickets only, path direct
+== W4. data both ways, forwarding, app ALPN, CLI over iroh
+PASS sync both ways, forwarded calls, app ALPN, CLI straight to win01
+== W5. a Linux machine that can reach only the dev tunnel joins through win01's relay
+PASS lin3 joined and synced through https://<tunnel>-3340.usw2.devtunnels.ms/
+== W6. Windows footprint
+RSS 63.4 MB, threads 17
+exe 29.8 MB
+ALL PASS

@@ -1,0 +1,78 @@
+== 1. machine init installs, starts the daemon, creates a cluster, writes a context
+PASS init took 3s, daemon active, context default
+== 2. init again is refused
+PASS second init refused
+== 3. machine add; a user install needs no sudo; a root login gets a system service
+PASS n3 runs as ops with no sudo (~/.local, socket 600, @reboot in its crontab); n1 as imesh (root login), n2 as imeshd (--run-as)
+== 4. every machine sees every other machine up
+PASS all 3 up from node1's view
+== 5. the CLI reaches a user daemon over ssh
+PASS ops@n3 reaches its own daemon over dial-stdio
+== 6. the CLI reaches the cluster over iroh (relay from this host into Docker)
+PASS iroh://a69de2cd9b0bb967a1b6d1d56d3a144a63cb8cdeb6ba915a4269fb63c9f02294 ping
+== 7. one machine forwards a call to another
+PASS call through n1 served by n3
+== 7b. an app ALPN between two machines, driven by an app API method
+PASS n1 opened imesh-example/echo/0 to n2
+== 8. a write on one machine reaches the others
+PASS kv written on n1, read on n3
+== 9. a machine goes down; the rest keep working; it catches up
+PASS n2 reported down after 5s; n1 and n3 still write and read
+PASS n2 caught up 0s after resume
+== 9b. a network split: both sides keep writing, then converge
+PASS both sides accepted writes during the split
+PASS n1 marked both peers down after 4s and stayed cut off 30s more
+PASS all three converged 4s after heal: later write won, both sides' keys kept
+== 10. a daemon restart keeps identity and state
+PASS same id and state after restart
+== 11. contexts: a second context for the same cluster, iroh first
+PASS ctx use, ctx conn reorder, IMESH_CONTEXT
+== 12. a dead connection falls through to the next one
+PASS dead ssh entry skipped
+== 13. a stranger cannot open the API or the sync ALPN
+PASS unknown CLI key rejected
+== 14. machine rm resets the machine and revokes it
+PASS n3 removed, reset with a new identity, out of the cluster
+== 15. self-hosted relay, no n0, no direct path between two networks
+PASS n4 and n5 connected only through the self-hosted relay
+== 17. app data at scale: 1000 keys of 1 KiB written on one machine
+PASS write 0.1s, all on n2 after 0.4s
+== 18. all UDP blocked on one machine: it joins and works through a members-only relay served by another machine
+PASS n7 with no UDP reached n6 only through n6's own relay, and synced
+== 19. no SSH: a machine installs itself, prints a ticket, and joins with the ticket that add prints
+PASS n8 joined with tickets only, no SSH from the CLI, and synced
+== 20. review fixes: iroh forwarding, key revocation, durable writes, safe re-runs, update
+PASS a call over the CLI's iroh connection is forwarded to another machine
+PASS a forwarded call runs as the CLI key, not as the forwarding member
+PASS a second CLI key works after client add, and fails after client rm
+PASS a write acknowledged while cut off survives kill -9 of its only holder
+PASS a refused init leaves the daemon and its settings alone
+PASS machine update kept the relay settings, added a label, and the relay-only pair stayed up
+PASS machine rm over the CLI's iroh connection reset n8
+PASS after update --system --run-as imeshsvc, deploy reaches the socket through the imesh group
+== 21. schema changes: new tables and columns reach every machine, also one that was away
+PASS a new table reached every machine, and rows flow both ways
+PASS n2 was paused while n1 added a column and a table and wrote to both; n2 has all of it 1s after resume
+PASS dropping or changing a column is refused where it is applied, and reaches no one: Error: won't remove column without the destructive flag set (table: 'app_notes', column: 'tags')
+== 21b. a schema conflict: during a split, two machines add different columns to one table
+PASS after the heal, the link reports the conflict and carries no rows
+PASS a schema with both columns, applied on one machine, ends the conflict; rows from both sides arrive 1s later
+== 21c. a compiled table grown at run time survives a restart; a reset machine rejoins
+PASS n2 restarted with the grown compiled table
+PASS n3, reset in stage 14, joined again with a new key and syncs both ways
+== 23. a user daemon comes back after a reboot: from its crontab, or as a systemd user service
+PASS after a reboot, the crontab started the detached daemon again with the same key
+PASS with linger, update --service systemd moved n3 to a user service; it starts at boot with no login
+== 22. the relay exposed through a dev tunnel (a stand-in devtunnel CLI)
+PASS n6 exposed its relay through the tunnel (http://172.19.0.5:3340/), kept the tunnel host running, and n7 syncs through the published URL
+== 24. --docker: the daemon in a sandboxed container, on a host with its own Docker (as a NAS)
+PASS host network: n9d runs read-only as 65532 with no capabilities, syncs, is up/direct from n1 on the same LAN, and keeps its key over a restart
+PASS machine update --docker replaced the container with the same key and a new label
+PASS bridge network behind Docker's NAT: n9b syncs, and n1 on the same LAN reaches it up/direct
+PASS --relay-only: n9r opens no UDP port but loopback, syncs, and n1 reaches it through the relay
+PASS machine rm removed the containers' machines
+== 16. footprint
+VmRSS: 79556 kB Threads: 30 
+VmRSS: 67820 kB Threads: 22 
+binary 44.4 MB
+ALL PASS

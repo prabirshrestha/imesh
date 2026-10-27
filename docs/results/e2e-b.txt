@@ -1,0 +1,59 @@
+== 1. machine init installs, starts the daemon, creates a cluster, writes a context
+PASS init took 2s, daemon active, context default
+== 2. init again is refused
+PASS second init refused
+== 3. machine add; the daemon runs as the SSH user, or as a --run-as user
+PASS n1 daemon runs as root (SSH user), n2 as imeshd (--run-as), n3 as deploy (SSH user), socket deploy:deploy 660
+== 4. every machine sees every other machine up
+NAME         ID         STATE    PATH    RTT      OS/ARCH        VERSION
+n2           229ac03eba up       direct  0ms      linux/aarch64  0.1.0
+n1           7797c224b0 up       self    -        linux/aarch64  0.1.0
+n3           bf208d1822 up       direct  0ms      linux/aarch64  0.1.0
+PASS all 3 up from node1's view
+== 5. a non-root user in the imesh group uses the socket over ssh
+PASS deploy@node3 ping over dial-stdio
+== 6. the CLI reaches the cluster over iroh (relay from this host into Docker)
+PASS iroh://7797c224b08de1fda8f3449af4deb1d75fe24cdc0f43a92b484ee60149283162 ping
+== 7. one machine forwards a call to another
+PASS call through n1 served by n3
+== 7b. an app ALPN between two machines, driven by an app API method
+PASS n1 opened imesh-example/echo/0 to n2
+== 8. a write on one machine reaches the others
+PASS kv written on n1, read on n3
+== 9. a machine goes down; the rest keep working; it catches up
+PASS n2 reported down after 12s; n1 and n3 still write and read
+PASS n2 caught up 0s after resume
+== 9b. a network split: both sides keep writing, then converge
+PASS both sides accepted writes during the split
+PASS n1 marked both peers down after 11s and stayed cut off 30s more
+PASS all three converged 3s after heal: later write won, both sides' keys kept
+== 10. a daemon restart keeps identity and state
+PASS same id and state after restart
+== 11. contexts: a second context for the same cluster, iroh first
+NAME             CURRENT  CONNECTIONS
+PASS ctx use, ctx conn reorder, IMESH_CONTEXT
+== 12. a dead connection falls through to the next one
+PASS dead ssh entry skipped
+== 13. a stranger cannot open the API or the sync ALPN
+PASS unknown CLI key rejected
+== 14. machine rm resets the machine and revokes it
+PASS n3 removed, reset with a new identity, out of the cluster
+== 15. self-hosted relay, no n0, no direct path between two networks
+NAME         ID         STATE    PATH    RTT      OS/ARCH        VERSION
+n4           586e72f4b6 up       self    -        linux/aarch64  0.1.0
+n5           f0992f3a12 up       relay   0ms      linux/aarch64  0.1.0
+PASS n4 and n5 connected only through the self-hosted relay
+== 17. app data at scale: 1000 keys of 1 KiB written on one machine
+PASS write 0.3s, all on n2 after 0.7s
+== 18. all UDP blocked on one machine: it joins and works through a members-only relay served by another machine
+NAME         ID         STATE    PATH    RTT      OS/ARCH        VERSION
+n6           79d2b11c39 up       self    -        linux/aarch64  0.1.0
+n7           f41722ed91 up       relay   0ms      linux/aarch64  0.1.0
+PASS n7 with no UDP reached n6 only through n6's own relay, and synced
+== 19. no SSH: a machine installs itself, prints a ticket, and joins with the ticket that add prints
+PASS n8 joined with tickets only, no SSH from the CLI, and synced
+== 16. footprint
+VmRSS: 43088 kB Threads: 38 
+VmRSS: 29628 kB Threads: 34 
+binary 25.2 MB
+ALL PASS

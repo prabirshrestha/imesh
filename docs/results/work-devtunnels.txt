@@ -1,0 +1,127 @@
+Work-machine dev tunnel proof, 2026-09-25 UTC
+Base commit: aa094f5, plus the crsqlite build fix.
+Hosts: psworkwin01 and psworklinux01, both x86_64.
+
+== provision-linux.log
+lin binary 49129168 compressed 19412562 sha256 e1a389df34141faf1e6a2c04ef1c3ad612965b2a43665336dce22172241b0f64
+/home/prshrest/imesh-work: OK
+imesh 0.1.0
+imesh daemon running for prshrest as a systemd user service; it starts at boot and keeps running after logout
+socket /home/prshrest/.local/share/imesh/imesh.sock
+
+stty: 'standard input': Inappropriate ioctl for device
+
+exit 0
+
+== provision-windows.log
+win binary 86136347 compressed 27544436 sha256 d145e7474abb2e43e41a717d3f8adbda02a6be2166bf01f4315057b70e7ed2d7
+imesh 0.1.0
+registered imesh task (runs while the user is logged on)
+imesh daemon is running
+
+
+exit 0
+
+== test.log
+{'cluster': 'bb16fde0a01d0429225797273d76bee0', 'id': 'b143a1c8be15f208c05554718bc55f89942263497ead26e405906b1e834d465b'}
+PASS Windows tunnel published
+{'cluster': 'bb16fde0a01d0429225797273d76bee0', 'members': 2}
+[
+  {
+    "id": "1ee512c713fdbf772c79a29f731dfeb0398aad660afbef67602349f67c163367",
+    "info": {
+      "addr": {
+        "addrs": [
+          {
+            "Relay": "https://use1-1.relay.n0.iroh.link./"
+          }
+        ],
+        "id": "1ee512c713fdbf772c79a29f731dfeb0398aad660afbef67602349f67c163367"
+      },
+      "arch": "x86_64",
+      "labels": {
+        "proof": "work-devtunnel"
+      },
+      "name": "psworklinux01",
+      "os": "linux",
+      "relay": "https://j4lg80b7-3340.use.devtunnels.ms/",
+      "version": "0.1.0"
+    },
+    "name": "psworklinux01",
+    "status": {
+      "error": null,
+      "last_seen": null,
+      "path": "self",
+      "rtt_ms": null,
+      "state": "up"
+    }
+  },
+  {
+    "id": "b143a1c8be15f208c05554718bc55f89942263497ead26e405906b1e834d465b",
+    "info": {
+      "addr": {
+        "addrs": [
+          {
+            "Relay": "https://366rc5ld-3340.usw3.devtunnels.ms/"
+          }
+        ],
+        "id": "b143a1c8be15f208c05554718bc55f89942263497ead26e405906b1e834d465b"
+      },
+      "arch": "x86_64",
+      "labels": {
+        "proof": "work-devtunnel"
+      },
+      "name": "cpc-prshr-2erm3",
+      "os": "windows",
+      "relay": "https://366rc5ld-3340.usw3.devtunnels.ms/",
+      "version": "0.1.0"
+    },
+    "name": "psworkwin01",
+    "status": {
+      "error": null,
+      "last_seen": 1790317840,
+      "path": "relay",
+      "rtt_ms": 69,
+      "schema": "ok",
+      "state": "up",
+      "swim": true
+    }
+  }
+]
+PASS windows-relay lin to win
+PASS windows-relay win to lin
+PASS forwarding both ways
+PASS Linux tunnel published
+PASS linux-relay lin to win
+PASS linux-relay win to lin
+PASS forwarding both ways
+ALL PASS relay switch and two-way sync
+
+== recovery2.log
+{'columns': ['id', 'body'], 'rows': [['linux', 'from-linux']]}
+PASS SQL rows reach Linux
+
+stty: 'standard input': Inappropriate ioctl for device
+
+exit 0
+PASS Linux restart keeps identity
+PASS offline schema and row catch-up
+ALL PASS restart, identity, schema, SQL, no-n0
+
+== offline-result.txt
+2026-09-25T06:36:08.707421+00:00 PASS round-0 writes and replication both ways
+2026-09-25T06:36:16.602950+00:00 PASS round-1 writes and replication both ways
+2026-09-25T06:36:23.201008+00:00 PASS round-2 writes and replication both ways
+2026-09-25T06:36:31.098002+00:00 PASS round-3 writes and replication both ways
+2026-09-25T06:36:37.688070+00:00 PASS round-4 writes and replication both ways
+2026-09-25T06:36:45.570009+00:00 PASS round-5 writes and replication both ways
+[{"id": "1ee512c713fdbf772c79a29f731dfeb0398aad660afbef67602349f67c163367", "info": {"addr": {"addrs": [{"Relay": "https://j4lg80b7-3340.use.devtunnels.ms/"}], "id": "1ee512c713fdbf772c79a29f731dfeb0398aad660afbef67602349f67c163367"}, "arch": "x86_64", "labels": {"proof": "work-devtunnel"}, "name": "psworklinux01", "os": "linux", "relay": "https://j4lg80b7-3340.use.devtunnels.ms/", "version": "0.1.0"}, "name": "psworklinux01", "status": {"error": null, "last_seen": null, "path": "self", "rtt_ms": null, "state": "up"}}, {"id": "b143a1c8be15f208c05554718bc55f89942263497ead26e405906b1e834d465b", "info": {"addr": {"addrs": [{"Relay": "https://j4lg80b7-3340.use.devtunnels.ms/"}], "id": "b143a1c8be15f208c05554718bc55f89942263497ead26e405906b1e834d465b"}, "arch": "x86_64", "labels": {"proof": "work-devtunnel"}, "name": "psworkwin01", "os": "windows", "relay": "https://366rc5ld-3340.usw3.devtunnels.ms/", "version": "0.1.0"}, "name": "psworkwin01", "status": {"error": null, "last_seen": 1790318210, "path": "relay", "rtt_ms": 139, "schema": "ok", "state": "up", "swim": true}}]
+ALL PASS: no Mac test session or Mac cluster member
+
+Checks: cargo x test PASS (15 tests), cargo x lint PASS.
+cargo x windows: PASS (clippy and release binaries).
+cargo x e2e PREFIX=work PORTS=29: BLOCKED before Docker tests.
+Local ARM64 linker: unsupported linker arg: --fix-cortex-a53-843419.
+Windows restart: PASS same ID, reconnected, KV read verified.
+Linux UDP socket check: imesh binds only 127.0.0.0/8 sockets.
+Existing unrelated SSH sessions were not stopped and did not carry imesh traffic.
