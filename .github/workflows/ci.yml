@@ -118,11 +118,12 @@ jobs:
       - name: Publish
         # Each package trusts this repository and ci.yml on npmjs.com, so npm takes the
         # GitHub OIDC token and adds provenance. A package that a failed run already published
-        # is skipped, so the tag can run again.
+        # is skipped, so the tag can run again. The "./" prefix is necessary: npm reads
+        # "out/name" as the GitHub repository "github:out/name".
         run: |
           version="${GITHUB_REF_NAME#v}"
-          for d in out/iroh-mesh-* out/iroh-mesh; do
-            name=$(node -p "require('./$d/package.json').name")
+          for d in ./out/iroh-mesh-* ./out/iroh-mesh; do
+            name=$(node -p "require('$d/package.json').name")
             if npm view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version is already published"
             else
