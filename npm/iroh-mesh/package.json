@@ -1,6 +1,6 @@
 {
   "name": "iroh-mesh",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Connect your computers into one cluster with no central server",
   "license": "MIT",
   "repository": {
@@ -17,12 +17,12 @@
     "node": ">=18"
   },
   "dependencies": {
-    "iroh-mesh-bundle": "0.0.2"
+    "iroh-mesh-bundle": "0.0.3"
   },
   "optionalDependencies": {
-    "iroh-mesh-darwin-arm64": "0.0.2",
-    "iroh-mesh-linux-arm64": "0.0.2",
-    "iroh-mesh-linux-x64": "0.0.2",
-    "iroh-mesh-windows-x64": "0.0.2"
+    "iroh-mesh-darwin-arm64": "0.0.3",
+    "iroh-mesh-linux-arm64": "0.0.3",
+    "iroh-mesh-linux-x64": "0.0.3",
+    "iroh-mesh-windows-x64": "0.0.3"
   }
 }

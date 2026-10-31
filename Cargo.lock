@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-mesh"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-mesh-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",
