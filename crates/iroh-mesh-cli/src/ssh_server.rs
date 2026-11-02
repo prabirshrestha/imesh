@@ -369,8 +369,36 @@ fn shell() -> (String, Vec<String>) {
         let ps = "powershell.exe".to_string();
         return (ps, vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into()]);
     }
-    let sh = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
-    (sh, vec!["-c".into()])
+    (login_shell(), vec!["-c".into()])
+}
+
+/// The login shell from the user record, else `$SHELL`, else `/bin/sh`. A service often has no
+/// `$SHELL`, so the user record comes first, as sshd does. SSH runs only in a user daemon, so
+/// the user has a login shell.
+fn login_shell() -> String {
+    user_record_shell()
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
+#[cfg(unix)]
+fn user_record_shell() -> Option<String> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: every pointer is valid for the call, and `buf` outlives the use of `pwd`.
+    let rc = unsafe { libc::getpwuid_r(libc::geteuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pwd.pw_shell.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_shell` points to a NUL-terminated string in `buf`.
+    let s = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }.to_string_lossy().into_owned();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(not(unix))]
+fn user_record_shell() -> Option<String> {
+    None
 }
 
 fn home() -> std::path::PathBuf {

@@ -60,7 +60,22 @@ fn trust(id: &EndpointId) -> Result<()> {
 }
 
 fn exe() -> String {
-    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "imesh".into())
+    proxy_exe()
+}
+
+/// The program a written `ProxyCommand` runs. A binary inside an npm package has a path that
+/// changes with each Node.js or package update, so then the command is `imesh` on PATH.
+pub fn proxy_exe() -> String {
+    proxy_exe_for(std::env::current_exe().ok().as_deref())
+}
+
+/// On Windows the npm launcher is `imesh.cmd`, which OpenSSH may not find as `imesh`, so the
+/// path stays.
+fn proxy_exe_for(exe: Option<&std::path::Path>) -> String {
+    match exe {
+        Some(p) if cfg!(windows) || !p.components().any(|c| c.as_os_str() == "node_modules") => p.display().to_string(),
+        _ => "imesh".into(),
+    }
 }
 
 /// Quotes a path for an SSH config value. `%` is a token there.
@@ -231,5 +246,24 @@ mod tests {
         assert_eq!(p("-tt -p 22 me@box ls", SSH_VALUE_FLAGS), ["me@box", "ls"]);
         assert_eq!(p("-o BatchMode=yes -p22 box", SSH_VALUE_FLAGS), ["box"]);
         assert_eq!(p("-r -P 22 /tmp/a box:/tmp/b", SCP_VALUE_FLAGS), ["/tmp/a", "box:/tmp/b"]);
+    }
+}
+
+#[cfg(test)]
+mod proxy_exe_tests {
+    use std::path::Path;
+
+    #[test]
+    #[cfg(not(windows))]
+    fn npm_binary_uses_path() {
+        let p = Path::new("/n/lib/node_modules/iroh-mesh-darwin-arm64/bin/imesh");
+        assert_eq!(super::proxy_exe_for(Some(p)), "imesh");
+        assert_eq!(super::proxy_exe_for(None), "imesh");
+    }
+
+    #[test]
+    fn other_binary_keeps_its_path() {
+        let p = Path::new("/usr/local/bin/imesh");
+        assert_eq!(super::proxy_exe_for(Some(p)), "/usr/local/bin/imesh");
     }
 }

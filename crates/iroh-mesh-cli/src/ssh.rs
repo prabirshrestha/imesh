@@ -179,9 +179,10 @@ pub fn tunnel_host_alias(t: &iroh_mesh::net::DevTunnel) -> String {
 }
 
 /// The SSH `ProxyCommand` that reaches the server through the tunnel: this executable, by its
-/// absolute path, as `imesh ssh-proxy`. `%` is escaped for SSH; the tunnel ID is checked.
+/// absolute path or `imesh` on PATH for an npm install, as `imesh ssh-tunnel-proxy`.
+/// `%` is escaped for SSH; the tunnel ID is checked.
 pub fn proxy_command(t: &iroh_mesh::net::DevTunnel) -> String {
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "imesh".into());
+    let exe = crate::ssh_client::proxy_exe();
     let dt = crate::devtunnel_cli::devtunnel_cli();
     format!(
         "\"{}\" ssh-tunnel-proxy {t} --devtunnel-cli \"{}\"",
