@@ -6,7 +6,10 @@
 //!   Its pipe is `\\.\pipe\imesh`, which the members of the local group `imesh` may open; the
 //!   install creates the group and adds the user who runs it.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -165,15 +168,27 @@ fn powershell(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn wait_for_pipe() -> Result<()> {
-    for _ in 0..100 {
-        if std::fs::metadata(paths::socket()).is_ok() {
-            println!("imesh daemon is running");
-            return Ok(());
+/// How long an install waits for the daemon's pipe. A first start can take more than 10 seconds.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits until `pipe` exists. False after [`START_TIMEOUT`].
+fn wait_for(pipe: &Path) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < START_TIMEOUT {
+        if std::fs::metadata(pipe).is_ok() {
+            return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
-    bail!("the daemon did not start; see {}", paths::data_dir().join("imesh.log").display())
+    false
+}
+
+fn wait_for_pipe() -> Result<()> {
+    if wait_for(&paths::socket()) {
+        println!("imesh daemon is running");
+        return Ok(());
+    }
+    bail!("the daemon did not start within {START_TIMEOUT:?}; see {}", paths::data_dir().join("imesh.log").display())
 }
 
 const SERVICE: &str = "imesh";
@@ -231,15 +246,12 @@ if ($LASTEXITCODE -ne 0) {{ throw "icacls failed: $LASTEXITCODE" }}
     powershell(&script)?;
     iroh_mesh::os::write_private(&data.join("env"), format_env(env)?.as_bytes())?;
     powershell(&format!("Start-Service {SERVICE}"))?;
-    for _ in 0..100 {
-        if std::fs::metadata(paths::SYSTEM_SOCKET).is_ok() {
-            println!("imesh Windows service running; it starts at boot. Pipe {}", paths::SYSTEM_SOCKET);
-            println!("members of the local group {} may use it; log in again to join it", paths::SYSTEM_GROUP);
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if wait_for(Path::new(paths::SYSTEM_SOCKET)) {
+        println!("imesh Windows service running; it starts at boot. Pipe {}", paths::SYSTEM_SOCKET);
+        println!("members of the local group {} may use it; log in again to join it", paths::SYSTEM_GROUP);
+        return Ok(());
     }
-    bail!("the service did not start; see {}", log.display())
+    bail!("the service did not start within {START_TIMEOUT:?}; see {}", log.display())
 }
 
 pub(super) fn uninstall_system(purge: bool) -> Result<()> {
