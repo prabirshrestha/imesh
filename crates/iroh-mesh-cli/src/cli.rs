@@ -465,6 +465,17 @@ fn start(register: Register) -> Result<()> {
         }
         None => tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init(),
     }
+    // A daemon started by a task or service has no visible stderr, so its log file must also
+    // hold the error that stopped it.
+    let to_file = cli.log_file.is_some();
+    let result = run_cmd(cli, register);
+    if to_file && let Err(e) = &result {
+        tracing::error!("{e:#}");
+    }
+    result
+}
+
+fn run_cmd(cli: Cli, register: Register) -> Result<()> {
     // Installs and the supervisor manage processes and need no runtime; the supervisor builds
     // its own.
     match cli.cmd {
