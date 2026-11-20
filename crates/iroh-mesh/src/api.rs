@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-pub const API_ALPN: &[u8] = b"imesh/api/0";
+pub const API_ALPN: &[u8] = b"imesh/api/1";
 /// The local API call that turns its stream into a raw stream to an ALPN of a member. See
 /// [`crate::client::Client::open`].
 pub const OPEN_METHOD: &str = "open";
@@ -79,19 +79,22 @@ pub struct Inspect {
     pub info: crate::state::MachineInfo,
     pub cluster: Option<String>,
     pub member: bool,
+    /// The machine's role in its cluster.
+    #[serde(default)]
+    pub role: Option<crate::roster::Role>,
+    /// A member refused this machine as removed, or its own roster removes it.
+    #[serde(default)]
+    pub removed: bool,
     /// The `--relay` list the machine started with.
     pub relays: Vec<iroh::RelayUrl>,
     pub n0: bool,
     /// Whether the machine is in the devtunnel mesh.
     #[serde(default)]
     pub devtunnel_mesh: bool,
-    /// The first port of the machine's gossip range.
-    #[serde(default = "default_gossip_base")]
-    pub gossip_port_base: u16,
-    /// The machine is the only member of its cluster, and the cluster holds no `kv` rows and
-    /// no app rows: leaving it loses nothing.
+    /// The machine is the only member of its cluster and keeps no app files: leaving it loses
+    /// nothing.
     #[serde(default)]
-    pub alone_and_empty: bool,
+    pub alone: bool,
 }
 
 /// One row of `cluster.machines`.
@@ -99,6 +102,7 @@ pub struct Inspect {
 pub struct MachineRow {
     pub id: EndpointId,
     pub name: String,
+    pub role: crate::roster::Role,
     pub info: Option<crate::state::MachineInfo>,
     pub status: crate::daemon::PeerStatus,
 }
@@ -112,17 +116,20 @@ pub struct JoinTicket {
     pub peers: Vec<iroh::EndpointAddr>,
     #[serde(default)]
     pub relays: crate::state::RelaySettings,
-    /// The cluster's gossip port base. Every member must use the same one.
-    #[serde(default = "default_gossip_base")]
-    pub gossip_port_base: u16,
     /// The mesh tunnel of each member that has one. The new machine forwards them before it
-    /// dials, because it has no replicated rows yet.
+    /// dials, because it has no roster yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnels: Vec<(iroh::EndpointId, crate::state::TunnelEndpoint)>,
+    /// The admitting machine's roster, with the new machine's admission in it.
+    pub roster: crate::roster::Roster,
 }
 
-fn default_gossip_base() -> u16 {
-    crate::state::GOSSIP_PORT_BASE
+/// The result of `cluster.init`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Initialized {
+    pub cluster: String,
+    /// The root key as text. It moves the owner to another machine. No machine keeps it.
+    pub recovery_code: String,
 }
 
 const JOIN_PREFIX: &str = "imeshjoin";

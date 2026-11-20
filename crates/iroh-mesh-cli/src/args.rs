@@ -124,23 +124,6 @@ impl Settings {
     }
 }
 
-/// Parses `90s`, `30m`, `12h`, or `7d`.
-pub(crate) fn parse_period(s: &str) -> Result<std::time::Duration, String> {
-    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-    let n: u64 = n.parse().map_err(|_| format!("{s:?} is not a period like 30m or 12h"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" | "" => n * 3600,
-        "d" => n * 86400,
-        _ => return Err(format!("{s:?} is not a period like 30m or 12h")),
-    };
-    if secs == 0 {
-        return Err("the period must be longer than 0".into());
-    }
-    Ok(std::time::Duration::from_secs(secs))
-}
-
 /// The HTTP proxy from `HTTPS_PROXY` or `HTTP_PROXY`, as curl reads them.
 pub fn proxy_from_env() -> Option<url::Url> {
     ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
@@ -211,12 +194,8 @@ pub struct NetArgs {
     /// interface, a random port.
     #[arg(long, env = "IMESH_BIND")]
     pub bind: Option<SocketAddr>,
-    /// The first loopback port of the cluster's gossip range. It uses 20000 ports from here. Every
-    /// member of a cluster must use the same value. Default: 20000.
-    #[arg(long, env = "IMESH_GOSSIP_PORT_BASE")]
-    pub gossip_port_base: Option<u16>,
-    /// The loopback port of this machine's relay with `--relay devtunnel`. Default: a port from
-    /// the machine key, 49152 to 65534.
+    /// The loopback port of this machine's relay with `--relay devtunnel`. Default: a free port,
+    /// which the machine keeps between runs while it is free. Set it only to force one.
     #[arg(long, env = "IMESH_MESH_PORT")]
     pub mesh_port: Option<u16>,
     /// Bearer token to present to relays that require one.
@@ -289,7 +268,6 @@ impl NetArgs {
             relay_ca: self.relay_ca.clone(),
             n0: self.has(&Relay::N0),
             bind: self.bind,
-            gossip_port_base: self.gossip_port_base,
             mesh_port: self.mesh_port,
             devtunnel_mesh: self.has(&Relay::DevTunnel),
             pkarr: self.pkarr.clone(),
@@ -301,7 +279,7 @@ impl NetArgs {
             devtunnel: self.devtunnel.clone(),
             proxy: self.proxy.clone(),
             relay_only: self.relay_only == Some(true),
-            devtunnel_cli: self.devtunnel_cli.clone(),
+            devtunnel_cli: Some(self.devtunnel_cli.clone().unwrap_or_else(crate::devtunnel_cli::devtunnel_cli)),
         }
     }
 
@@ -338,7 +316,6 @@ impl NetArgs {
         set("IMESH_RELAYS", (!self.relays.is_empty()).then_some(join));
         set("IMESH_RELAY_TOKEN", self.relay_token.clone());
         set("IMESH_BIND", self.bind.map(|a| a.to_string()));
-        set("IMESH_GOSSIP_PORT_BASE", self.gossip_port_base.map(|p| p.to_string()));
         set("IMESH_MESH_PORT", self.mesh_port.map(|p| p.to_string()));
         set("IMESH_RELAY_CA", path(&self.relay_ca));
         set("IMESH_PKARR", self.pkarr.as_ref().map(|u| u.to_string()));

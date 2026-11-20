@@ -1,4 +1,0 @@
-[submodule "vendor/corrosion"]
-	path = vendor/corrosion
-	url = https://github.com/superfly/corrosion
-	ignore = dirty

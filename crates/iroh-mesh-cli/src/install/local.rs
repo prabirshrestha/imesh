@@ -40,6 +40,9 @@ pub struct Local {
     /// What changed in `update`: `installed`, `started`, `settings`, `binary`, `bundle`,
     /// `restarted`. In `up`: `cluster` when it started one, `joined` when it joined one.
     pub changed: Vec<&'static str>,
+    /// The new cluster's recovery code, when `up` started one. It is shown once only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
 }
 
 /// The installed user executable, if any.
@@ -129,7 +132,7 @@ fn merged(settings: &Settings, name: Option<&str>) -> Env {
     env
 }
 
-async fn finish(changed: Vec<&'static str>, out: &Output) -> Result<()> {
+async fn finish(changed: Vec<&'static str>, recovery_code: Option<String>, out: &Output) -> Result<()> {
     let i = health().await?;
     let members = match &i {
         Some(i) if i.cluster.is_some() => members().await.ok(),
@@ -142,6 +145,7 @@ async fn finish(changed: Vec<&'static str>, out: &Output) -> Result<()> {
         cluster: i.as_ref().and_then(|i| i.cluster.clone()),
         members,
         changed,
+        recovery_code,
     };
     out.print(&r, |r| {
         let what = if r.changed.is_empty() { "nothing changed".to_string() } else { r.changed.join(", ") };
@@ -157,6 +161,9 @@ async fn finish(changed: Vec<&'static str>, out: &Output) -> Result<()> {
             (Some(c), Some(n)) => println!("cluster {c}, with {n} machines"),
             (Some(c), None) => println!("cluster {c}"),
             (None, _) => println!("in no cluster"),
+        }
+        if let Some(code) = &r.recovery_code {
+            crate::machine::print_recovery_code(code);
         }
     })
 }
@@ -191,11 +198,12 @@ pub async fn up(mut args: LocalArgs, join: Option<String>, force: bool, out: &Ou
         }
         (None, Some(_)) => {}
         (None, None) => {
-            start_cluster().await?;
+            let code = start_cluster().await?;
             changed.push("cluster");
+            return finish(changed, code, out).await;
         }
     }
-    finish(changed, out).await
+    finish(changed, None, out).await
 }
 
 /// Whether this machine chose its relays: with flags now, or in its saved settings.
@@ -207,12 +215,14 @@ fn has_relay_settings(args: &LocalArgs) -> bool {
         || ["IMESH_RELAYS", "IMESH_DEVTUNNEL"].iter().any(|k| saved.contains_key(*k))
 }
 
-/// Starts a cluster on this computer's daemon, with this machine as its only member.
-async fn start_cluster() -> Result<()> {
+/// Starts a cluster on this computer's daemon, with this machine as its only member. Returns
+/// its recovery code.
+async fn start_cluster() -> Result<Option<String>> {
     let c = crate::connect::open(&Connection::local()).await?;
     let r = c.call::<serde_json::Value>(None, "cluster.init", serde_json::json!({})).await;
     c.close().await;
-    r.map(drop).context("start a cluster on this machine")
+    let v = r.context("start a cluster on this machine")?;
+    Ok(v["recovery_code"].as_str().map(String::from))
 }
 
 /// Installs the daemon if needed, applies the settings, and starts it.
@@ -310,7 +320,7 @@ pub async fn update(args: LocalArgs, out: &Output) -> Result<()> {
             blocking(start).await?;
             changed.push("started");
         }
-        return finish(changed, out).await;
+        return finish(changed, None, out).await;
     }
     if !same_exe {
         changed.push("binary");
@@ -335,5 +345,5 @@ pub async fn update(args: LocalArgs, out: &Output) -> Result<()> {
     }
     result?;
     changed.push("restarted");
-    finish(changed, out).await
+    finish(changed, None, out).await
 }

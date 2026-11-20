@@ -172,11 +172,14 @@ async fn devtunnel(
     }
     let details = json_of(&dt(cli, &["show", &tunnel, "-j"]).await?)?;
     let show: Show = serde_json::from_value(details.clone())?;
-    ensure!(
-        show.tunnel.ports.iter().all(|p| p.port_number == port),
-        "use a dedicated devtunnel with only the relay port"
-    );
+    // A port other than the relay port: on this machine's own tunnel, from an earlier mesh port.
+    let stale: Vec<String> =
+        show.tunnel.ports.iter().filter(|x| x.port_number != port).map(|x| x.port_number.to_string()).collect();
+    ensure!(id.is_none() || stale.is_empty(), "use a dedicated devtunnel with only the relay port");
     ensure!(!anonymous(&details), "devtunnel {tunnel} allows anonymous access; remove that access first");
+    for old in &stale {
+        dt(cli, &["port", "delete", &tunnel, "-p", old]).await?;
+    }
     if !show.tunnel.ports.iter().any(|x| x.port_number == port) {
         dt(cli, &["port", "create", &tunnel, "-p", &p, "--protocol", "http"]).await?;
     }
@@ -191,7 +194,7 @@ async fn devtunnel(
     // Clients authenticate with `devtunnel connect` and forward this same port locally.
     // The HTTPS web-forwarding URL stays private and is not an iroh relay address.
     let local: RelayUrl = format!("http://127.0.0.1:{port}/").parse()?;
-    wait_ready(&mut child, None).await?;
+    wait_ready(&mut child, false).await?;
     info!(%tunnel, %local, "private relay hosted through devtunnel");
     url.send_replace(Some(Hosted { url: local, tunnel: tunnel.clone() }));
     let started = tokio::time::Instant::now();
@@ -273,19 +276,12 @@ fn anonymous(value: &serde_json::Value) -> bool {
     }
 }
 
-/// A private tunnel forwarded by the logged-in devtunnel CLI. The same port must be
-/// free on each client. Use one tunnel per endpoint; loopback URLs do not name a tunnel.
+/// A private tunnel forwarded by the logged-in devtunnel CLI. Use one tunnel per endpoint;
+/// loopback URLs do not name a tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connect {
     pub id: String,
     pub port: u16,
-}
-
-/// The relay port of a machine in the devtunnel mesh, from its key. `devtunnel connect` forwards
-/// a tunnel's port to the same local port number, so each member needs its own. 49152..65535.
-pub fn mesh_port(id: &EndpointId) -> u16 {
-    let b = id.as_bytes();
-    49152 + (u16::from_le_bytes([b[0], b[1]]) % 16383)
 }
 
 impl std::str::FromStr for Connect {
@@ -319,7 +315,7 @@ impl Connect {
     pub async fn start(&self, cli: Option<PathBuf>) -> Result<AbortOnDropHandle<()>> {
         valid_id(&self.id)?;
         ensure!(self.port != 0, "devtunnel port must not be zero");
-        let first = self.connect(cli.as_deref()).await?;
+        let (first, _) = self.connect(cli.as_deref(), true).await?;
         let config = self.clone();
         Ok(AbortOnDropHandle::new(tokio::spawn(async move {
             let mut child = first;
@@ -335,8 +331,8 @@ impl Connect {
                 loop {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(60));
-                    match config.connect(cli.as_deref()).await {
-                        Ok(next) => {
+                    match config.connect(cli.as_deref(), true).await {
+                        Ok((next, _)) => {
                             child = next;
                             break;
                         }
@@ -347,20 +343,22 @@ impl Connect {
         })))
     }
 
-    /// Starts one forwarding child and waits until it listens on the exact port. The caller
-    /// owns the child: dropping it stops the forward.
-    pub(crate) async fn run_once(&self, cli: Option<&Path>) -> Result<tokio::process::Child> {
-        self.connect(cli).await
+    /// Starts one forwarding child and waits until it listens. Returns the child and its local
+    /// port: the tunnel's port, or another one when that is in use. The caller owns the child:
+    /// dropping it stops the forward.
+    pub(crate) async fn run_once(&self, cli: Option<&Path>) -> Result<(tokio::process::Child, u16)> {
+        self.connect(cli, false).await
     }
 
-    /// Runs until the forwarding child exits, or stops it when its port stops accepting
+    /// Runs until the forwarding child exits, or stops it when its local `port` stops accepting
     /// connections. Returns why it stopped.
-    pub(crate) async fn watch(&self, child: &mut tokio::process::Child) -> Result<String> {
-        supervise(child, CHECK_EVERY, || listening(self.port)).await
+    pub(crate) async fn watch(&self, child: &mut tokio::process::Child, port: u16) -> Result<String> {
+        supervise(child, CHECK_EVERY, || listening(port)).await
     }
 
-    async fn connect(&self, cli: Option<&Path>) -> Result<tokio::process::Child> {
-        // Do not attach to an unrelated listener or accept the CLI's alternate-port fallback.
+    /// With `exact`, the local port must be the tunnel's port, because every member names the
+    /// relay by that URL. Else the CLI may pick another free port, which it prints.
+    async fn connect(&self, cli: Option<&Path>, exact: bool) -> Result<(tokio::process::Child, u16)> {
         let details = json_of(&dt(cli, &["show", &self.id, "-j"]).await?)?;
         ensure!(!anonymous(&details), "devtunnel {} allows anonymous access", self.id);
         let ports = details
@@ -371,13 +369,15 @@ impl Connect {
             ports.len() == 1 && ports[0]["portNumber"].as_u64() == Some(u64::from(self.port)),
             "use a dedicated devtunnel with only the requested relay port"
         );
-        let probe = tokio::net::TcpSocket::new_v4()?;
-        probe.set_reuseaddr(true)?;
-        probe
-            .bind((std::net::Ipv4Addr::LOCALHOST, self.port).into())
-            .with_context(|| format!("devtunnel local port {} is in use", self.port))?;
-        let probe = probe.listen(1).with_context(|| format!("devtunnel local port {} is in use", self.port))?;
-        drop(probe);
+        if exact {
+            let probe = tokio::net::TcpSocket::new_v4()?;
+            probe.set_reuseaddr(true)?;
+            probe
+                .bind((std::net::Ipv4Addr::LOCALHOST, self.port).into())
+                .with_context(|| format!("devtunnel local port {} is in use", self.port))?;
+            let probe = probe.listen(1).with_context(|| format!("devtunnel local port {} is in use", self.port))?;
+            drop(probe);
+        }
         let mut child = command(cli)
             .args(["connect", &self.id])
             .stdin(Stdio::null())
@@ -386,8 +386,9 @@ impl Connect {
             .kill_on_drop(true)
             .spawn()
             .context("start devtunnel connect (install the CLI and log in first)")?;
-        wait_ready(&mut child, Some(&format!("127.0.0.1:{}", self.port))).await?;
-        Ok(child)
+        let port = wait_ready(&mut child, true).await?.expect("a forward reports its port");
+        ensure!(!exact || port == self.port, "devtunnel local port {} is in use", self.port);
+        Ok((child, port))
     }
 }
 
@@ -461,13 +462,15 @@ async fn listening(port: u16) -> Check {
     }
 }
 
-async fn wait_ready(child: &mut tokio::process::Child, expected: Option<&str>) -> Result<()> {
+/// Waits until a host is ready, or with `forward` until a forward listens. Returns the forward's
+/// local port.
+async fn wait_ready(child: &mut tokio::process::Child, forward: bool) -> Result<Option<u16>> {
     let mut out = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
     let mut err = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut ready = Ready::default();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    let port = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let line = tokio::select! {
                 line = out.next_line(), if stdout_open => {
@@ -483,11 +486,11 @@ async fn wait_ready(child: &mut tokio::process::Child, expected: Option<&str>) -
                 status = child.wait() => bail!("devtunnel child exited: {}", status?),
             };
             let Some(line) = line else { continue };
-            if match expected {
-                Some(at) => ready.update(&line, at),
-                None => line.contains("Ready to accept connections for tunnel:"),
-            } {
-                return Ok(());
+            if !forward && line.contains("Ready to accept connections for tunnel:") {
+                return Ok(None);
+            }
+            if forward && let Some(port) = ready.update(&line) {
+                return Ok(Some(port));
             }
         }
     })
@@ -504,20 +507,27 @@ async fn wait_ready(child: &mut tokio::process::Child, expected: Option<&str>) -
             tracing::debug!(%line, "devtunnel stderr");
         }
     });
-    Ok(())
+    Ok(port)
 }
 
 #[derive(Default)]
 struct Ready {
     connected: bool,
-    listening: bool,
+    listening: Option<u16>,
 }
 
 impl Ready {
-    fn update(&mut self, line: &str, expected: &str) -> bool {
+    /// The local port, once the child is connected and listens on IPv4 loopback.
+    fn update(&mut self, line: &str) -> Option<u16> {
         self.connected |= line.contains("Connected to tunnel:");
-        self.listening |= line.contains(&format!("PortForwardingService listening on {expected}."));
-        self.connected && self.listening
+        if let Some(port) = line
+            .split_once("PortForwardingService listening on 127.0.0.1:")
+            .and_then(|(_, rest)| rest.strip_suffix('.'))
+            .and_then(|p| p.parse().ok())
+        {
+            self.listening = Some(port);
+        }
+        self.listening.filter(|_| self.connected)
     }
 }
 
@@ -528,7 +538,6 @@ mod tests {
     async fn host_rejects_invalid_library_id_before_running_cli() {
         let url = watch::channel(None).0;
         let machine = iroh::SecretKey::generate().public();
-        assert!((49152..65535).contains(&mesh_port(&machine)));
         let error = devtunnel(None, Some("--help"), 3340, machine, "m", &url).await.unwrap_err();
         assert_eq!(error.to_string(), "invalid devtunnel ID");
         assert!(url.borrow().is_none());
@@ -597,16 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn forwarding_rule_is_not_readiness() {
+    fn a_forward_is_ready_on_the_port_it_listens_on() {
         let mut ready = Ready::default();
-        let at = "127.0.0.1:3340";
-        assert!(!ready.update("SSH: Forwarding from 127.0.0.1:3340 to host port 3340.", at));
-        assert!(!ready.update("Connected to tunnel: test", at));
-        assert!(!ready.update("SSH: PortForwardingService listening on 127.0.0.1:3341.", at));
-        assert!(ready.update("SSH: PortForwardingService listening on 127.0.0.1:3340.", at));
+        assert_eq!(ready.update("SSH: Forwarding from 127.0.0.1:3341 to host port 3340."), None);
+        assert_eq!(ready.update("Connected to tunnel: test"), None);
+        assert_eq!(ready.update("SSH: PortForwardingService listening on ::1:3341."), None);
+        assert_eq!(ready.update("SSH: PortForwardingService listening on 127.0.0.1:3341."), Some(3341));
         let mut ready = Ready::default();
-        assert!(!ready.update("SSH: PortForwardingService listening on 127.0.0.1:3340.", at));
-        assert!(ready.update("Connected to tunnel: test", at));
+        assert_eq!(ready.update("SSH: PortForwardingService listening on 127.0.0.1:3340."), None);
+        assert_eq!(ready.update("Connected to tunnel: test"), Some(3340));
     }
 
     #[test]

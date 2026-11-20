@@ -79,10 +79,22 @@ imesh status --json
 `up` saves its flags. A later `imesh up` with no flags keeps the same settings.
 `imesh up --<flag>` changes only that setting.
 
+A new cluster prints a recovery code once. Tell the user to keep it in a safe place. Do not save
+it in a file, a note, or a log. No machine keeps it.
+
+## Know the roles
+
+The machine that started the cluster is the owner. The owner makes plain members admins with
+`imesh promote <machine>`. Only the owner and admins can add machines. The owner removes any
+machine. Admins remove plain members. `imesh status` shows the role of each machine.
+
+If the owner is lost, `imesh recover` on another machine reads the recovery code from stdin and
+makes that machine the owner. Let the user type the code. Do not pass it as an argument.
+
 ## Add a machine
 
-To add a machine that the user can open a terminal on, pair it. First, on a member, create a
-pairing code:
+To add a machine that the user can open a terminal on, pair it. First, on the owner or an admin,
+create a pairing code:
 
 ```bash
 imesh invite machine2 --devtunnel
@@ -98,12 +110,12 @@ imesh up --join <pairing code> --ssh
 ```
 
 Both machines print the same short ID. The user must compare the two IDs, and then confirm on
-the member. Do not pass `--yes` to `invite` unless the user asks for it.
+the inviting machine. Do not pass `--yes` to `invite` unless the user asks for it.
 
 A pairing code is valid for 15 minutes and admits one machine.
 
-To add a server that the user reaches over SSH, run this on any computer with access to the
-cluster:
+To add a server that the user reaches over SSH, run this on a computer whose context reaches the
+owner or an admin:
 
 ```bash
 imesh add user@host
@@ -119,15 +131,15 @@ imesh ssh machine2 uname -a
 imesh scp ./file.txt machine2:file.txt
 ```
 
-## Check a machine and share small values
+## Check a machine
 
 ```bash
 imesh ping machine2 -n 1
-imesh kv set status/build ok --ttl 10m
-imesh kv get status/build
+imesh status --json
 ```
 
-Every machine has a copy of each `kv` key, and the last write wins. Do not use `kv` as a lock.
+`imesh status` asks every machine to answer, so it shows which machines are up now. Machines
+send nothing to each other when nothing changes.
 
 ## Choose a relay
 
@@ -156,7 +168,8 @@ If it is not logged in, ask the user to run `devtunnel user login`.
 
 With `--relay devtunnel`, each machine is a relay. If one machine stops, the other machines
 still connect through the remaining relays. Each machine has one tunnel, named
-`imesh-<name>-<short id>`. `imesh logout` deletes it.
+`imesh-<name>-<short id>`. `imesh logout` deletes it. Each machine serves its relay on one local
+port. By default it takes a free port and keeps it between runs while it is free. Add `--mesh-port <port>` only to force one.
 
 A pairing code that starts with `imeshpair1-dtm-` comes from a cluster that uses the devtunnel
 relay. `up --join` with this code adds `--relay devtunnel`, so the new machine also serves a
@@ -184,7 +197,8 @@ imesh relay set https://relay.example.com
 
 ## Ask before you change machines
 
-- Ask before you run `imesh rm`, `imesh logout`, or `imesh relay set`. These commands remove
-  machines, delete data, or change the connections of every member.
+- Ask before you run `imesh rm`, `imesh logout`, `imesh promote`, `imesh recover`, or
+  `imesh relay set`. These commands remove machines, delete data, change who may change the
+  cluster, or change the connections of every member.
 - Ask before you run an install on a remote server with `--system`. It needs root or sudo.
 - Do not print or copy files from the imesh data directory. It contains the machine key.

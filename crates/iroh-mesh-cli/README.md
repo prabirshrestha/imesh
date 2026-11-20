@@ -26,7 +26,7 @@ An app that wants its own command line uses the `imesh` library directly. An app
 
 ```rust
 fn main() -> std::process::ExitCode {
-    iroh_mesh_cli::run(|b| b.schema(MY_TABLES).method("my.method", my_method))
+    iroh_mesh_cli::run(|b| b.method("my.method", my_method))
 }
 ```
 

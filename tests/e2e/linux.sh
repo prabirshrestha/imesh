@@ -19,7 +19,7 @@ pass() { printf 'PASS %s\n' "$*"; }
 fail() { printf 'FAIL %s\n' "$*"; exit 1; }
 
 echo "work dir $WORK"
-# Test the example app, built as any app is (iroh_mesh_cli::run plus its own tables and methods), when
+# Test the example app, built as any app is (iroh_mesh_cli::run plus its own ALPN and methods), when
 # the crate has one; a prototype without it uses its plain binary.
 if [ -f "$CRATE/examples/app.rs" ]; then BUILD="--example app"; OUT=examples/app; else BUILD=; OUT=imesh; fi
 # The CLI under test runs from the bundle, which it finds beside itself. A full bundle has every
@@ -96,10 +96,12 @@ $I ctx add n8 "ops@localhost:${PB}08" >/dev/null
 
 echo "== 1. add --new installs, starts the daemon, creates a cluster, writes a context"
 t0=$(date +%s)
-$I add root@localhost:${PB}01 --new --relay n0 >/dev/null
+out=$($I add root@localhost:${PB}01 --new --relay n0)
 [ "$(docker exec $P-n1 systemctl is-active imesh)" = active ] || fail "daemon not active"
 grep -q 'current_context = "default"' "$WORK/cfg/config.toml" || fail "no default context"
-pass "add --new took $(($(date +%s) - t0))s, daemon active, context default"
+CODE=$(echo "$out" | awk '$1=="recovery" && $2=="code:"{print $3}')
+[ -n "$CODE" ] || fail "add --new printed no recovery code: $out"
+pass "add --new took $(($(date +%s) - t0))s, daemon active, context default, recovery code printed"
 
 echo "== 2. add --new again is refused"
 $I add root@localhost:${PB}01 --new >/dev/null 2>&1 && fail "second add --new allowed" || pass "second add --new refused"
@@ -117,99 +119,62 @@ pass "n3 runs as ops with no sudo (~/.local, socket 600, @reboot in its crontab)
 
 echo "== 4. every machine sees every other machine up"
 for i in $(seq 1 30); do
-	up=$($I status | awk 'NR>1 && $3=="up"' | wc -l | tr -d ' ')
+	up=$($I status | awk 'NR>1 && $4=="up"' | wc -l | tr -d ' ')
 	[ "$up" = 3 ] && break
 	sleep 1
 done
 [ "$up" = 3 ] || { $I status; fail "not all up"; }
 $I status
-pass "all 3 up from node1's view"
+roles() { $I "$@" status --jq '.[] | .name + "=" + .role' | sort | tr '\n' ' '; }
+[ "$(roles)" = "n1=owner n2=member n3=member " ] || fail "roles: $(roles)"
+for n in n2 n3; do [ "$(roles -c $n)" = "n1=owner n2=member n3=member " ] || fail "roles on $n: $(roles -c $n)"; done
+pass "all 3 up from node1's view; every machine sees n1 as the owner and n2, n3 as members"
 
 echo "== 5. the CLI reaches a user daemon over ssh"
 [ "$($I -c n3 dev call ping)" = '"pong"' ] || fail "ops ping"
 pass "ops@n3 reaches its own daemon over dial-stdio"
 
 echo "== 7. one machine forwards a call to another"
-name=$($I -c n1 dev call machine.inspect -m n3 | grep -m1 '"name"')
+name=$($I -c n1 dev call machine.inspect -m n3 | awk '/"name"/ && !n++')
 echo "$name" | grep -q n3 || fail "forward: $name"
 pass "call through n1 served by n3"
 
 echo "== 7b. an app ALPN between two machines, driven by an app API method"
-ID2=$($I -c n2 dev call machine.inspect | awk -F'"' '/"id"/{print $4; exit}')
+ID2=$($I -c n2 dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}')
 out=$($I -c n1 dev call example.dial "{\"to\":\"$ID2\",\"text\":\"hi n2\"}" 2>&1 || true)
 echo "$out" | grep -q '"echo": "hi n2"' || fail "example ALPN: $out"
 pass "n1 opened imesh-example/echo/0 to n2"
 
-echo "== 8. a write on one machine reaches the others"
-$I -c n1 kv set k v1 >/dev/null
-for i in $(seq 1 20); do [ "$($I -c n3 kv get k)" = v1 ] && break; sleep 0.5; done
-[ "$($I -c n3 kv get k)" = v1 ] || fail "kv not synced"
-pass "kv written on n1, read on n3"
+echo "== 7c. a plain member cannot remove another member"
+out=$($I -c n3 rm n2 2>&1) && fail "plain member n3 removed n2: $out"
+echo "$out" | grep -q "run this on n1" || fail "the refusal does not name the owner: $out"
+[ "$($I -c n1 status --jq '.[] | select(.name == "n2") | .status.state')" = up ] || fail "n2 is not up after the refused rm"
+[ "$($I -c n2 dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}')" = "$ID2" ] || fail "the refused rm reset n2"
+pass "n3 rm n2 refused ($(echo "$out" | tail -1)); n2 stays up with the same key"
 
-echo "== 9. a machine goes down; the rest keep working; it catches up"
+echo "== 9. a machine goes down; the rest keep working; it comes back up"
+state_of() { $I -c "$1" status --jq ".[] | select(.name == \"$2\") | .status.state"; }
 docker pause $P-n2 >/dev/null
-$I -c n1 kv set k2 while-down >/dev/null
-for i in $(seq 1 20); do [ "$($I -c n3 kv get k2)" = while-down ] && break; sleep 0.5; done
-[ "$($I -c n3 kv get k2)" = while-down ] || fail "n3 did not get the write made while n2 was down"
-for i in $(seq 1 90); do
-	s=$($I -c n1 status | awk '$1=="n2"{print $3}')
-	[ "$s" = down ] && break
-	sleep 1
-done
-[ "$s" = down ] || fail "n2 not reported down"
-pass "n2 reported down after ${i}s; n1 and n3 still write and read"
+t0=$(date +%s)
+[ "$(state_of n1 n2)" = down ] || { $I -c n1 status -w; fail "n2 not reported down"; }
+[ "$(state_of n1 n3)" = up ] || fail "n3 not up while n2 is down"
+[ "$(state_of n3 n1)" = up ] || fail "n1 not up in n3's view while n2 is down"
+pass "n2 reported down by one status probe after $(($(date +%s) - t0))s; n1 and n3 still see each other up"
 docker unpause $P-n2 >/dev/null
 t0=$(date +%s)
-until [ "$($I -c n2 kv get k2 2>/dev/null)" = while-down ]; do
-	[ $(($(date +%s) - t0)) -gt 60 ] && fail "n2 did not catch up"
+until [ "$(state_of n1 n2)" = up ]; do
+	[ $(($(date +%s) - t0)) -gt 30 ] && fail "n2 not up after resume"
 	sleep 1
 done
-pass "n2 caught up $(($(date +%s) - t0))s after resume"
-
-echo "== 9b. a network split: both sides keep writing, then converge"
-# n1 keeps only its SSH server, which the test drives. It loses n2, n3, and every relay.
-docker exec -i $P-n1 nft -f - <<EOF
-table inet split {
-	chain in { type filter hook input priority 0; policy drop; iif lo accept; tcp dport 22 accept; }
-	chain out { type filter hook output priority 0; policy drop; oif lo accept; tcp sport 22 accept; }
-}
-EOF
-$I -c n1 kv set split n1-side >/dev/null
-sleep 1
-$I -c n2 kv set split n2-side-later >/dev/null
-$I -c n2 kv set only-n2-side 1 >/dev/null
-$I -c n1 kv set only-n1-side 1 >/dev/null
-[ "$($I -c n1 kv get split)" = n1-side ] || fail "n1 lost its own write during split"
-for i in $(seq 1 20); do [ "$($I -c n3 kv get split)" = n2-side-later ] && break; sleep 0.5; done
-[ "$($I -c n3 kv get split)" = n2-side-later ] || fail "n3 missed n2 write during split"
-pass "both sides accepted writes during the split"
-for i in $(seq 1 60); do
-	d=$($I -c n1 status | awk '$3=="down"' | wc -l | tr -d ' ')
-	[ "$d" = 2 ] && break
-	sleep 1
-done
-[ "$d" = 2 ] || fail "n1 did not mark n2 and n3 down"
-sleep 30
-pass "n1 marked both peers down after ${i}s and stayed cut off 30s more"
-docker exec $P-n1 nft delete table inet split
-t0=$(date +%s)
-for n in n1 n2 n3; do
-	until [ "$($I -c "$n" kv get split 2>/dev/null)" = n2-side-later ] &&
-		[ "$($I -c "$n" kv get only-n1-side 2>/dev/null)" = 1 ] &&
-		[ "$($I -c "$n" kv get only-n2-side 2>/dev/null)" = 1 ]; do
-		[ $(($(date +%s) - t0)) -gt 90 ] && fail "no convergence on $n"
-		sleep 1
-	done
-done
-pass "all three converged $(($(date +%s) - t0))s after heal: later write won, both sides' keys kept"
+pass "n2 up $(($(date +%s) - t0))s after resume"
 
 echo "== 10. a service restart keeps identity and state"
-id_before=$($I -c n2 dev call machine.inspect | grep -m1 '"id"')
+id_before=$($I -c n2 dev call machine.inspect | awk '/"id"/ && !n++')
 docker exec $P-n2 systemctl restart imesh
 sleep 1
-[ "$($I -c n2 dev call machine.inspect | grep -m1 '"id"')" = "$id_before" ] || fail "identity changed"
-[ "$($I -c n2 kv get k)" = v1 ] || fail "state lost"
-pass "same id and state after restart"
+[ "$($I -c n2 dev call machine.inspect | awk '/"id"/ && !n++')" = "$id_before" ] || fail "identity changed"
+[ "$(roles -c n2)" = "n1=owner n2=member n3=member " ] || fail "roster lost: $(roles -c n2)"
+pass "same id and roster after restart"
 
 echo "== 11. contexts: a second context for the same cluster"
 cp "$WORK/cfg/config.toml" "$WORK/config.before"
@@ -236,11 +201,11 @@ pass "dead ssh entry skipped"
 cp "$WORK/config.before" "$WORK/cfg/config.toml"
 
 echo "== 14. rm resets the machine and revokes it"
-ID3=$($I -c n3 dev call machine.inspect | awk -F'"' '/"id"/{print $4; exit}')
+ID3=$($I -c n3 dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}')
 $I rm n3 >/dev/null
 $I status | grep -q '^n3 ' && fail "n3 still listed"
 for i in $(seq 1 30); do
-	new3=$($I -c n3 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/{print $4; exit}' || true)
+	new3=$($I -c n3 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/ && !n++ {print $4}' || true)
 	[ -n "$new3" ] && [ "$new3" != "$ID3" ] && break
 	sleep 0.5
 done
@@ -265,25 +230,13 @@ $I -c relayonly add root@localhost:${PB}04 --new --relay http://$P-relay:3340 >/
 $I ctx use default >/dev/null
 $I -c relayonly add root@localhost:${PB}05 >/dev/null
 for i in $(seq 1 30); do
-	p=$($I -c relayonly status | awk '$1=="n5"{print $3"/"$4}')
+	p=$($I -c relayonly status | awk '$1=="n5"{print $4"/"$5}')
 	[ "$p" = up/relay ] && break
 	sleep 1
 done
 $I -c relayonly status
 [ "$p" = up/relay ] || fail "n5 not up over relay"
 pass "n4 and n5 connected only through the self-hosted relay"
-
-echo "== 17. app data at scale: 1000 keys of 1 KiB written on one machine"
-now() { python3 -c 'import time;print(time.time())'; }
-t0=$(now)
-$I -c n1 dev call kv.fill '{"prefix":"bulk","count":1000,"bytes":1024}' >/dev/null
-t1=$(now)
-until [ "$($I -c n2 dev call kv.count '{"prefix":"bulk"}')" = 1000 ]; do
-	[ "$(python3 -c "print(int($(now) - $t0))")" -gt 120 ] && fail "bulk did not reach n2"
-	sleep 0.2
-done
-t2=$(now)
-pass "$(python3 -c "print(f'write {$t1-$t0:.1f}s, all on n2 after {$t2-$t0:.1f}s')")"
 
 echo "== 18. all UDP blocked on one machine: it joins and works through a members-only relay served by another machine"
 $I -c udp add root@localhost:${PB}06 --new --serve-relay 0.0.0.0:3340 --relay "http://$P-n6:3340" >/dev/null
@@ -296,36 +249,32 @@ table inet noudp {
 EOF
 $I -c udp add root@localhost:${PB}07 >/dev/null
 for i in $(seq 1 30); do
-	p=$($I -c udp status | awk '$1=="n7"{print $3"/"$4}')
+	p=$($I -c udp status | awk '$1=="n7"{print $4"/"$5}')
 	[ "$p" = up/relay ] && break
 	sleep 1
 done
 $I -c udp status
 [ "$p" = up/relay ] || fail "n7 not up over the relay on n6"
-$I -c udp kv set udp over-tcp >/dev/null
-for i in $(seq 1 20); do [ "$($I -c n7 kv get udp)" = over-tcp ] && break; sleep 0.5; done
-[ "$($I -c n7 kv get udp)" = over-tcp ] || fail "no sync over the relay"
+[ "$($I -c n7 status | awk '$1=="n6"{print $4"/"$5}')" = up/relay ] || fail "n6 not up/relay in n7's view"
 docker exec "$P-n6" journalctl -u imesh --no-pager | grep -q "relay serving members" || fail "relay not started on n6"
-pass "n7 with no UDP reached n6 only through n6's own relay, and synced"
+pass "n7 with no UDP reached n6 only through n6's own relay, both ways"
 
 echo "== 19. a server that ran up alone, in its own empty cluster, is reset by add and joins"
 docker cp -q "$BIN" "$P-n8:/usr/local/bin/imesh-setup"
 docker exec -u ops -w /home/ops "$P-n8" /usr/local/bin/imesh-setup up --relay n0 --service detached >/dev/null
 alone=$($I -c n8 dev call machine.inspect)
-echo "$alone" | grep -q '"alone_and_empty": true' || fail "n8 is not alone in an empty cluster: $alone"
-old8=$(echo "$alone" | awk -F'"' '/"id"/{print $4; exit}')
+echo "$alone" | grep -q '"alone": true' || fail "n8 is not alone in its cluster: $alone"
+old8=$(echo "$alone" | awk -F'"' '/"id"/ && !n++ {print $4}')
 $I add "ops@localhost:${PB}08" --name n8 >/dev/null
 for i in $(seq 1 30); do
-	s=$($I status | awk '$1=="n8"{print $3}')
+	s=$($I status | awk '$1=="n8"{print $4}')
 	[ "$s" = up ] && break
 	sleep 1
 done
 [ "$s" = up ] || { $I status; fail "n8 not up"; }
-[ "$($I -c n8 dev call machine.inspect | awk -F'"' '/"id"/{print $4; exit}')" != "$old8" ] || fail "n8 kept the key of its own cluster"
-$I kv set n8 joined >/dev/null
-for i in $(seq 1 20); do [ "$($I -c n8 kv get n8)" = joined ] && break; sleep 0.5; done
-[ "$($I -c n8 kv get n8)" = joined ] || fail "n8 did not sync"
-pass "n8 left its own empty cluster, joined with a new key, and synced"
+[ "$($I -c n8 dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}')" != "$old8" ] || fail "n8 kept the key of its own cluster"
+[ "$($I -c n8 status --jq '.[] | select(.name == "n1") | .role + "/" + .status.state')" = owner/up ] || fail "n8 does not see n1 as an owner that is up"
+pass "n8 left its own empty cluster, joined with a new key, and sees the owner"
 
 echo "== 20. review fixes: forwarding, durable writes, safe re-runs, update"
 [ "$($I -c n1 dev call whoami -m n2 | awk -F'"' '/"caller"/{print $4}')" = member ] || fail "forward from the local socket"
@@ -337,16 +286,21 @@ table inet solo {
 	chain out { type filter hook output priority 0; policy drop; oif lo accept; tcp sport 22 accept; }
 }
 EOF
-$I -c n1 kv set durable acked >/dev/null
+# The member names in a machine's own roster, with no probe.
+names_on() { $I -c "$1" dev call cluster.machines 2>/dev/null | python3 -c 'import json,sys; t=sys.stdin.read(); print(" ".join(sorted(r["name"] for r in json.loads(t))) if t.strip() else "", end=" ")' || true; }
+$I -c n1 rename n2 n2r >/dev/null
 docker exec "$P-n1" pkill -9 -f 'imesh service run'
 for i in $(seq 1 40); do
-	v=$($I -c n1 kv get durable 2>/dev/null || true)
-	[ -n "$v" ] && break
+	v=$(names_on n1)
+	case " $v" in *" n2r "*) break ;; esac
 	sleep 0.5
 done
 docker exec "$P-n1" nft delete table inet solo
-[ "$v" = acked ] || fail "acknowledged write lost after kill -9: $v"
-pass "a write acknowledged while cut off survives kill -9 of its only holder"
+case " $v" in *" n2r "*) ;; *) fail "a rename acknowledged while cut off was lost after kill -9: $v" ;; esac
+$I -c n1 rename n2r n2 >/dev/null
+for i in $(seq 1 20); do case " $(names_on n2)" in *" n2 "*) break ;; esac; sleep 0.5; done
+case " $(names_on n2)" in *" n2 "*) ;; *) fail "the rename back did not reach n2: $(names_on n2)" ;; esac
+pass "a roster change signed while cut off survives kill -9 of its only holder"
 
 pid=$(docker exec "$P-n1" systemctl show -p MainPID --value imesh)
 env_before=$(docker exec "$P-n1" cat /etc/imesh/env)
@@ -360,17 +314,17 @@ $I -c relayonly update server "root@localhost:${PB}04" --label role=gateway >/de
 docker exec "$P-n4" grep -q "IMESH_RELAYS=.*n0" /etc/imesh/env && fail "update turned on n0"
 docker exec "$P-n4" grep -q 'IMESH_LABELS=role=gateway' /etc/imesh/env || fail "update did not add the label"
 for i in $(seq 1 30); do
-	p=$($I -c relayonly status | awk '$1=="n5"{print $3"/"$4}')
+	p=$($I -c relayonly status | awk '$1=="n5"{print $4"/"$5}')
 	[ "$p" = up/relay ] && break
 	sleep 1
 done
 [ "$p" = up/relay ] || fail "relay-only pair broke after update"
 pass "update server kept the relay settings, added a label, and the relay-only pair stayed up"
 
-old8=$($I -c n8 dev call machine.inspect | awk -F'"' '/"id"/{print $4; exit}')
+old8=$($I -c n8 dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}')
 $I rm n8 >/dev/null
 for i in $(seq 1 30); do
-	new8=$($I -c n8 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/{print $4; exit}' || true)
+	new8=$($I -c n8 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/ && !n++ {print $4}' || true)
 	[ -n "$new8" ] && [ "$new8" != "$old8" ] && break
 	sleep 0.5
 done
@@ -383,100 +337,60 @@ $I update server "deploy@localhost:${PB}01" --system --run-as imeshsvc >/dev/nul
 [ "$($I -c n1d dev call ping)" = '"pong"' ] || fail "deploy cannot reach the socket through the group"
 pass "after update --system --run-as imeshsvc, deploy reaches the socket through the imesh group"
 
-echo "== 21. schema changes: new tables and columns reach every machine, also one that was away"
-N1="-c n1"
-N2="-c n2"
-cat >"$WORK/v1.sql" <<'SQL'
-CREATE TABLE app_notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL DEFAULT '');
-SQL
-$I $N1 dev schema-apply "$WORK/v1.sql" >/dev/null
-for i in $(seq 1 40); do $I $N2 dev sql "SELECT count(*) FROM app_notes" >/dev/null 2>&1 && break; sleep 0.5; done
-$I $N2 dev sql "SELECT count(*) FROM app_notes" >/dev/null || fail "n2 did not get table app_notes"
-$I $N2 dev sql --exec "INSERT INTO app_notes (id, body) VALUES ('a', 'from n2')" >/dev/null
-for i in $(seq 1 40); do [ "$($I $N1 dev sql "SELECT body FROM app_notes WHERE id = 'a'" | tail -1)" = "from n2" ] && break; sleep 0.5; done
-[ "$($I $N1 dev sql "SELECT body FROM app_notes WHERE id = 'a'" | tail -1)" = "from n2" ] || fail "row from n2 not on n1"
-pass "a new table reached every machine, and rows flow both ways"
+echo "== 21. the owner promotes n2; the admin n2 adds a machine"
+$I -c n2 promote n2 >/dev/null 2>&1 && fail "a plain member promoted itself"
+$I promote n2 >/dev/null
+for i in $(seq 1 20); do [ "$($I -c n2 status --jq '.[] | select(.name == "n2") | .role')" = admin ] && break; sleep 0.5; done
+[ "$($I -c n2 status --jq '.[] | select(.name == "n2") | .role')" = admin ] || fail "n2 does not see itself as admin"
+$I -c n2 add "$N3" --name n3b >/dev/null
+for c in n1 n2 n3; do
+	[ "$(roles -c $c)" = "n1=owner n2=admin n3b=member " ] || fail "roles on $c after n2 added n3b: $(roles -c $c)"
+done
+pass "n2 is an admin and added n3b; n1, n2, and n3b agree on every role"
 
-docker pause "$P-n2" >/dev/null
-cat >"$WORK/v2.sql" <<'SQL'
-CREATE TABLE app_notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL DEFAULT '', tags TEXT);
-CREATE TABLE app_tags (name TEXT NOT NULL PRIMARY KEY, color TEXT NOT NULL DEFAULT '');
-SQL
-$I $N1 dev schema-apply "$WORK/v2.sql" >/dev/null
-$I $N1 dev sql --exec "INSERT INTO app_notes (id, body, tags) VALUES ('b', 'while n2 was away', 'x,y')" >/dev/null
-$I $N1 dev sql --exec "INSERT INTO app_tags (name, color) VALUES ('x', 'red')" >/dev/null
-$I $N1 dev sql --exec "UPDATE app_notes SET tags = 'late' WHERE id = 'a'" >/dev/null
-sleep 3
-docker unpause "$P-n2" >/dev/null
-got() { $I $N2 dev sql "SELECT (SELECT tags FROM app_notes WHERE id = 'b') || '|' || (SELECT tags FROM app_notes WHERE id = 'a') || '|' || (SELECT color FROM app_tags WHERE name = 'x')" 2>&1 | tail -1; }
-start=$(date +%s)
-for i in $(seq 1 120); do [ "$(got)" = "x,y|late|red" ] && break; sleep 0.5; done
-[ "$(got)" = "x,y|late|red" ] || { $I $N2 dev schema-ls; fail "n2 after it came back: $(got)"; }
-pass "n2 was paused while n1 added a column and a table and wrote to both; n2 has all of it $(($(date +%s) - start))s after resume"
-
-cat >"$WORK/v3.sql" <<'SQL'
-CREATE TABLE app_notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL DEFAULT '');
-SQL
-if $I $N1 dev schema-apply "$WORK/v3.sql" >"$WORK/v3.out" 2>&1; then fail "dropping a column was accepted"; fi
-cat >"$WORK/v4.sql" <<'SQL'
-CREATE TABLE app_notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL DEFAULT '', tags INTEGER);
-SQL
-if $I $N1 dev schema-apply "$WORK/v4.sql" >"$WORK/v4.out" 2>&1; then fail "changing a column type was accepted"; fi
-if $I $N1 dev sql --exec "DROP TABLE app_notes" >/dev/null 2>&1; then fail "sql --exec dropped a table"; fi
-$I $N1 dev schema-ls | grep -q "tags TEXT" || fail "a refused schema replaced the cluster schema"
-[ "$($I $N2 dev sql "SELECT tags FROM app_notes WHERE id = 'b'" | tail -1)" = "x,y" ] || fail "n2 lost column tags"
-for i in $(seq 1 20); do $I $N1 dev schema-ls | grep -q '"n2": "ok"' && break; sleep 0.5; done
-$I $N1 dev schema-ls | grep -q '"n2": "ok"' || { $I $N1 dev schema-ls; fail "rows do not pass between n1 and n2 after the refused changes"; }
-pass "dropping or changing a column is refused where it is applied, and reaches no one: $(head -c 120 "$WORK/v3.out")"
-
-echo "== 21b. a schema conflict: during a split, two machines add different columns to one table"
-docker exec -i $P-n1 nft -f - <<EOF
+echo "== 21b. a network split: each side changes the roster, and every machine agrees after it heals"
+# n1, the owner, is cut off from everything but the Docker gateway: the CLI still reaches it over
+# SSH, but it reaches neither n2, the admin, nor n3b, nor the n0 relay.
+gw=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$P-n1")
+docker exec -i "$P-n1" nft -f - <<EOF
 table inet split {
-	chain in { type filter hook input priority 0; policy drop; iif lo accept; tcp dport 22 accept; }
-	chain out { type filter hook output priority 0; policy drop; oif lo accept; tcp sport 22 accept; }
+	chain in { type filter hook input priority 0; iif lo accept; ip saddr $gw accept; drop; }
+	chain out { type filter hook output priority 0; oif lo accept; ip daddr $gw accept; drop; }
 }
 EOF
-base="CREATE TABLE app_notes (id TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL DEFAULT '', tags TEXT"
-echo "$base, colour_a TEXT);" >"$WORK/v5a.sql"
-echo "$base, colour_b TEXT);" >"$WORK/v5b.sql"
-$I $N1 dev schema-apply "$WORK/v5a.sql" >/dev/null
-$I $N2 dev schema-apply "$WORK/v5b.sql" >/dev/null
-$I $N1 dev sql --exec "INSERT INTO app_notes (id, colour_a) VALUES ('c', 'red')" >/dev/null
-$I $N2 dev sql --exec "INSERT INTO app_notes (id, colour_b) VALUES ('d', 'blue')" >/dev/null
-$I $N1 kv set during-conflict n1 >/dev/null
-docker exec $P-n1 nft delete table inet split
-for i in $(seq 1 40); do $I $N1 dev schema-ls | grep -q '"n2": "schema conflict' && break; sleep 0.5; done
-$I $N1 dev schema-ls | grep -q '"n2": "schema conflict' || { $I $N1 dev schema-ls; fail "n1 does not report the conflict with n2"; }
-sleep 5
-[ "$($I $N2 dev sql "SELECT count(*) FROM app_notes WHERE id = 'c'" | tail -1)" = 0 ] || fail "a row passed a link with a schema conflict"
-pass "after the heal, the link reports the conflict and carries no rows"
-echo "$base, colour_a TEXT, colour_b TEXT);" >"$WORK/v6.sql"
-$I $N1 dev schema-apply "$WORK/v6.sql" >/dev/null
-both() { $I $1 dev sql "SELECT (SELECT colour_a FROM app_notes WHERE id = 'c') || '|' || (SELECT colour_b FROM app_notes WHERE id = 'd')" 2>/dev/null | tail -1; }
-for i in $(seq 1 60); do [ "$(both "$N2")" = "red|blue" ] && [ "$(both "$N1")" = "red|blue" ] && break; sleep 0.5; done
-[ "$(both "$N2")" = "red|blue" ] && [ "$(both "$N1")" = "red|blue" ] || { $I $N1 dev schema-ls; fail "after the fix: n1 $(both "$N1"), n2 $(both "$N2")"; }
-[ "$($I $N2 kv get during-conflict)" = n1 ] || fail "kv write from the conflict did not arrive"
-$I $N1 dev schema-ls | grep -q '"n2": "ok"' || fail "link not ok after the fix"
-pass "a schema with both columns, applied on one machine, ends the conflict; rows from both sides arrive $((i / 2))s later"
-
-echo "== 21c. a compiled table grown at run time survives a restart; a reset machine rejoins"
-echo "CREATE TABLE example_notes (who TEXT NOT NULL PRIMARY KEY, text TEXT NOT NULL DEFAULT '', mood TEXT);" >"$WORK/grow.sql"
-$I $N1 dev schema-apply "$WORK/grow.sql" >/dev/null
-for i in $(seq 1 40); do $I $N2 dev sql "SELECT mood FROM example_notes" >/dev/null 2>&1 && break; sleep 0.5; done
-docker exec $P-n2 systemctl restart imesh
-for i in $(seq 1 40); do [ "$($I $N2 dev call ping 2>/dev/null)" = '"pong"' ] && break; sleep 0.5; done
-[ "$($I $N2 dev call ping)" = '"pong"' ] || { docker exec $P-n2 journalctl -u imesh --no-pager -n 20; fail "n2 did not start again after a compiled table grew"; }
-$I $N2 dev sql "SELECT mood FROM example_notes" >/dev/null || fail "n2 lost column mood after the restart"
-pass "n2 restarted with the grown compiled table"
-$I add "$N3" --name n3b >/dev/null
-$I -c n3 kv set from-n3b 1 >/dev/null
-for i in $(seq 1 40); do [ "$($I $N1 kv get from-n3b)" = 1 ] && break; sleep 0.5; done
-[ "$($I $N1 kv get from-n3b)" = 1 ] || fail "n3 did not sync after it was reset and added again"
-[ "$($I -c n3 kv get during-conflict)" = n1 ] || fail "n3 did not get the older rows"
-pass "n3, reset in stage 14, joined again with a new key and syncs both ways"
+newid() { openssl genpkey -algorithm ed25519 | openssl pkey -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n'; }
+G1=$(newid) G2=$(newid)
+$I -c n1 dev call cluster.add "{\"id\":\"$G1\",\"name\":\"ghost1\"}" >/dev/null
+$I -c n2 dev call cluster.add "{\"id\":\"$G2\",\"name\":\"ghost2\"}" >/dev/null
+$I -c n1 rename n3b n3left >/dev/null
+$I -c n2 rename n3b n3right >/dev/null
+[ "$(state_of n2 n1)" = up ] && fail "n2 reaches n1 during the split"
+roles -c n1 | grep -q ghost2 && fail "n1 knows ghost2 during the split"
+roles -c n2 | grep -q ghost1 && fail "n2 knows ghost1 during the split"
+docker exec "$P-n1" nft delete table inet split
+# No member is told when the split heals: the retries after the failed hellos, and these status
+# probes, bring the sides together.
+for i in $(seq 1 90); do
+	a=$(roles -c n1) b=$(roles -c n2) c=$(roles -c n3)
+	[ "$a" = "$b" ] && [ "$b" = "$c" ] && break
+	sleep 1
+done
+[ "$a" = "$b" ] && [ "$b" = "$c" ] || fail "after the split: n1 [$a], n2 [$b], n3b [$c]"
+case $a in *ghost1=member*ghost2=member*) ;; *) fail "a change from one side was lost: $a" ;; esac
+case $a in *n3left=member* | *n3right=member*) ;; *) fail "n3b has neither name from the split: $a" ;; esac
+healed=$((i))
+n3now=$(echo "$a" | tr ' ' '\n' | grep -E '^n3(left|right)=' | cut -d= -f1)
+$I -c n1 dev call cluster.remove "{\"id\":\"$G1\"}" >/dev/null
+$I -c n1 dev call cluster.remove "{\"id\":\"$G2\"}" >/dev/null
+$I -c n1 rename "$n3now" n3b >/dev/null
+for c in n1 n2 n3; do
+	for i in $(seq 1 30); do [ "$(roles -c $c)" = "n1=owner n2=admin n3b=member " ] && break; sleep 1; done
+	[ "$(roles -c $c)" = "n1=owner n2=admin n3b=member " ] || fail "roles on $c after the cleanup: $(roles -c $c)"
+done
+pass "n1 and n2 each admitted a machine and renamed n3b during a split; ${healed}s after it healed, every machine had both admissions and the same name ($n3now) for n3b"
 
 echo "== 23. a user daemon comes back after a reboot: from its crontab, or as a systemd user service"
-id3() { $I -c n3 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/{print $4; exit}'; }
+id3() { $I -c n3 dev call machine.inspect 2>/dev/null | awk -F'"' '/"id"/ && !n++ {print $4}'; }
 up3() { for i in $(seq 1 60); do [ "$(id3)" = "$1" ] && return 0; sleep 1; done; return 1; }
 ID3=$(id3)
 docker restart "$P-n3" >/dev/null
@@ -494,6 +408,53 @@ up3 "$ID3" || fail "the systemd user service did not come back after a reboot"
 unit3 || fail "after the reboot, the daemon is not in the user's imesh.service"
 pass "with linger, update --service systemd moved n3 to a user service; it starts at boot with no login"
 
+echo "== 26. a machine removed while it is paused reports removed at its first hello after it comes back"
+id_on() { $I -c "$1" dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}'; }
+removed_on() { $I -c "$1" dev call machine.inspect 2>/dev/null | grep -q '"removed": true'; }
+$I add "ops@localhost:${PB}08" --name n8b >/dev/null
+[ "$(state_of n1 n8b)" = up ] || fail "n8b not up"
+docker pause "$P-n8" >/dev/null
+t0=$(date +%s)
+$I rm n8b >"$WORK/rm8.out" 2>&1 || { cat "$WORK/rm8.out"; fail "rm of the paused n8b failed"; }
+took=$(($(date +%s) - t0))
+for c in n1 n2 n3; do $I -c $c status | grep -q '^n8b ' && fail "$c still lists n8b"; done
+docker unpause "$P-n8" >/dev/null
+t0=$(date +%s)
+# Machines send nothing when idle, so the removed machine learns at its next hello: a start, a
+# change, the 10-minute resync, or a status probe, as here.
+$I -c n8 status >/dev/null 2>&1 || true
+until removed_on n8; do
+	if [ $(($(date +%s) - t0)) -gt 30 ]; then
+		$I -c n8 dev call machine.inspect
+		docker exec "$P-n8" sh -c 'tail -n 30 /home/ops/.local/share/imesh/*.log' | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-300
+		fail "n8b does not report removed 30s after resume"
+	fi
+	sleep 1
+done
+pass "rm of the paused n8b took ${took}s; no member lists it; it reports removed $(($(date +%s) - t0))s after resume"
+
+echo "== 27. n2 is removed while n3b is paused; n3b drops n2 at the first hello after it comes back, and refuses it"
+ID3=$(id_on n3)
+docker pause "$P-n3" >/dev/null
+# cluster.remove, not rm: n2 keeps its key, so it can try n3b afterwards.
+$I dev call cluster.remove "{\"id\":\"$ID2\"}" >/dev/null
+[ "$(roles)" = "n1=owner n3b=member " ] || fail "roles on n1 after the removal: $(roles)"
+docker unpause "$P-n3" >/dev/null
+lists_n2() { $I -c n3 dev call cluster.machines | grep -q '"name": "n2"'; }
+# The first hello may come from a member that changed its roster since, or from this probe.
+t0=$(date +%s)
+$I -c n3 status >/dev/null
+until ! lists_n2; do
+	[ $(($(date +%s) - t0)) -gt 30 ] && { $I -c n3 status; fail "n3b still lists n2 30s after it came back"; }
+	sleep 1
+done
+dropped=$(($(date +%s) - t0))
+out=$($I -c n2 dev call example.dial "{\"to\":\"$ID3\",\"text\":\"x\"}" 2>&1) && fail "n3b accepted the removed n2: $out"
+echo "$out" | grep -q 4031 || fail "n3b refused n2 without the removed code: $out"
+$I -c n2 status >/dev/null 2>&1 || true
+removed_on n2 || { $I -c n2 dev call machine.inspect; fail "n2 does not report removed"; }
+pass "n3b dropped n2 ${dropped}s after it came back and refused it with 4031; n2 reports removed"
+
 echo "== 22. the relay exposed through a dev tunnel (a stand-in devtunnel CLI)"
 # The stand-in answers the commands imesh runs and reports a local relay URL once
 # `devtunnel host` runs. Microsoft's service is not used.
@@ -504,7 +465,7 @@ FT=/var/lib/imesh/fake-devtunnel
 relay_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$P-n6")
 docker exec -d "$P-n6" sh -c "echo \$\$ >/tmp/imesh-relay-migration.pid; exec socat TCP-LISTEN:3340,bind=$relay_ip,reuseaddr,fork TCP:127.0.0.1:3340"
 for i in $(seq 1 60); do
-	url=$($I -c udp relay ls | awk -F'"' '/"url"/{print $4; exit}')
+	url=$($I -c udp relay ls | awk -F'"' '/"url"/ && !n++ {print $4}')
 	[ "$url" = "http://127.0.0.1:3340/" ] && break
 	sleep 1
 done
@@ -532,66 +493,68 @@ done
 [ "$connector2" != "$connector1" ] || fail "the devtunnel connector was not restarted"
 docker exec "$P-n6" cat $FT/create-args | grep -q -- ' -a' && fail "anonymous tunnel requested"
 # The old relay stopped when n6 moved its listener to loopback. Both members are
-# disconnected during this cutover, so set the new address through each local API.
+# disconnected during this cutover, so owner n6 sets the new address through its local API.
 $I -c n6 relay set "$url" >/dev/null
-$I -c n7 relay set "$url" >/dev/null
-$I -c udp kv set via-tunnel-url 1 >/dev/null
-for i in $(seq 1 40); do [ "$($I -c n7 kv get via-tunnel-url)" = 1 ] && break; sleep 0.5; done
-[ "$($I -c n7 kv get via-tunnel-url)" = 1 ] || {
+# Only the owner and admins set the cluster relays. n7 reaches the relay through its own tunnel
+# and takes n6's setting at its first hello.
+$I -c n7 relay set "$url" >/dev/null 2>&1 && fail "plain member n7 set the cluster relays"
+for i in $(seq 1 120); do [ "$($I -c n7 status | awk '$1=="n6"{print $4}')" = up ] && break; sleep 0.5; done
+[ "$($I -c n7 status | awk '$1=="n6"{print $4}')" = up ] || {
     docker exec "$P-n6" journalctl -u imesh --no-pager -n 45
     docker exec "$P-n7" journalctl -u imesh --no-pager -n 45
-    fail "n7 did not sync with the tunnel URL as the cluster relay"
+    fail "n7 does not reach n6 with the tunnel URL as the cluster relay"
 }
 docker exec "$P-n6" sh -c 'kill "$(cat /tmp/imesh-relay-migration.pid)"'
 docker exec "$P-n7" systemctl restart imesh
-$I -c udp kv set after-relay-migration 2 >/dev/null
-for i in $(seq 1 40); do [ "$($I -c n7 kv get after-relay-migration)" = 2 ] && break; sleep 0.5; done
-[ "$($I -c n7 kv get after-relay-migration)" = 2 ] || fail "n7 needs the removed relay migration bridge"
-pass "n6 exposed its relay through the tunnel ($url), kept the tunnel host running, and n7 syncs through the published URL"
+for i in $(seq 1 120); do [ "$($I -c n7 status | awk '$1=="n6"{print $4}')" = up ] && break; sleep 0.5; done
+[ "$($I -c n7 status | awk '$1=="n6"{print $4}')" = up ] || fail "n7 needs the removed relay migration bridge"
+for i in $(seq 1 120); do [ "$($I -c udp status | awk '$1=="n7"{print $4}')" = up ] && break; sleep 0.5; done
+[ "$($I -c udp status | awk '$1=="n7"{print $4}')" = up ] || fail "n6 does not reach n7 after the migration"
+pass "n6 exposed its relay through the tunnel ($url), kept the tunnel host running, and n6 and n7 reach each other through the published URL"
 
 echo "== 24. --docker: the daemon in a sandboxed container, on a host with its own Docker (as a NAS)"
 # ops is in n9's docker group and has no sudo. n9's Docker runs inside n9, so host networking
 # means n9's own LAN address, and bridge networking means Docker's NAT inside n9.
 N9="ops@localhost:${PB}09"
 D9() { docker exec "$P-n9" docker "$@"; }
-id_of() { $I dev call machine.inspect -m "$1" 2>/dev/null | awk -F'"' '/"id"/{print $4; exit}'; }
-path_of() { $I status | awk -v n="$1" '$1==n{print $3"/"$4}'; }
+id_of() { $I dev call machine.inspect -m "$1" 2>/dev/null | awk -F'"' '/"id"/ && !n++ {print $4}'; }
+path_of() { $I status | awk -v n="$1" '$1==n{print $4"/"$5}'; }
+# The machine's own view of the cluster: the roster reached it.
+sees_n1() { $I dev call cluster.machines -m "$1" 2>/dev/null | grep -q '"name": "n1"'; }
 $I add "$N9" --docker --name n9d >/dev/null
 [ "$(D9 inspect -f '{{.HostConfig.RestartPolicy.Name}} {{.HostConfig.ReadonlyRootfs}} {{.Config.User}} {{.HostConfig.NetworkMode}} {{.HostConfig.CapDrop}}' imesh)" = "unless-stopped true 65532:65532 host [ALL]" ] ||
 	fail "container settings: $(D9 inspect -f '{{.HostConfig.RestartPolicy.Name}} {{.HostConfig.ReadonlyRootfs}} {{.Config.User}} {{.HostConfig.NetworkMode}} {{.HostConfig.CapDrop}}' imesh)"
-$I kv set to-docker 1 >/dev/null
-for i in $(seq 1 40); do [ "$($I dev call kv.get '{"key":"to-docker"}' -m n9d 2>/dev/null)" = 1 ] && break; sleep 0.5; done
-[ "$($I dev call kv.get '{"key":"to-docker"}' -m n9d)" = 1 ] || fail "n9d did not sync"
+for i in $(seq 1 40); do sees_n1 n9d && break; sleep 0.5; done
+sees_n1 n9d || fail "n9d has no roster with n1"
 for i in $(seq 1 30); do [ "$(path_of n9d)" = up/direct ] && break; sleep 1; done
 [ "$(path_of n9d)" = up/direct ] || fail "n1 reaches n9d as $(path_of n9d), not up/direct"
 idd=$(id_of n9d)
 D9 restart imesh >/dev/null
 for i in $(seq 1 60); do [ "$(id_of n9d)" = "$idd" ] && break; sleep 1; done
 [ "$(id_of n9d)" = "$idd" ] || fail "n9d lost its key after a container restart"
-pass "host network: n9d runs read-only as 65532 with no capabilities, syncs, is up/direct from n1 on the same LAN, and keeps its key over a restart"
+pass "host network: n9d runs read-only as 65532 with no capabilities, has the roster, is up/direct from n1 on the same LAN, and keeps its key over a restart"
 $I update server "$N9" --docker --label where=docker >/dev/null
 D9 inspect -f '{{range .Config.Env}}{{println .}}{{end}}' imesh | grep -q '^IMESH_LABELS=where=docker$' || fail "update did not set the label"
 for i in $(seq 1 60); do [ "$(id_of n9d)" = "$idd" ] && break; sleep 1; done
 [ "$(id_of n9d)" = "$idd" ] || fail "update --docker changed the key"
 pass "update server --docker replaced the container with the same key and a new label"
 $I add "$N9" --docker --docker-name imesh-b --docker-network bridge --name n9b >/dev/null
-$I kv set to-bridge 1 >/dev/null
-for i in $(seq 1 40); do [ "$($I dev call kv.get '{"key":"to-bridge"}' -m n9b 2>/dev/null)" = 1 ] && break; sleep 0.5; done
-[ "$($I dev call kv.get '{"key":"to-bridge"}' -m n9b)" = 1 ] || fail "n9b did not sync"
+for i in $(seq 1 40); do sees_n1 n9b && break; sleep 0.5; done
+sees_n1 n9b || fail "n9b has no roster with n1"
 for i in $(seq 1 30); do [ "$(path_of n9b)" = up/direct ] && break; sleep 1; done
 [ "$(path_of n9b)" = up/direct ] || fail "n1 reaches n9b as $(path_of n9b), not up/direct"
-pass "bridge network behind Docker's NAT: n9b syncs, and n1 on the same LAN reaches it up/direct"
+pass "bridge network behind Docker's NAT: n9b has the roster, and n1 on the same LAN reaches it up/direct"
 $I add "$N9" --docker --docker-name imesh-r --docker-network bridge --relay-only --name n9r >/dev/null
-$I kv set to-relay-only 1 >/dev/null
-for i in $(seq 1 60); do [ "$($I dev call kv.get '{"key":"to-relay-only"}' -m n9r 2>/dev/null)" = 1 ] && break; sleep 0.5; done
-[ "$($I dev call kv.get '{"key":"to-relay-only"}' -m n9r)" = 1 ] || fail "n9r did not sync"
+for i in $(seq 1 60); do sees_n1 n9r && break; sleep 0.5; done
+sees_n1 n9r || fail "n9r has no roster with n1"
+for i in $(seq 1 30); do [ "$(path_of n9r)" = up/relay ] && break; sleep 1; done
 [ "$(path_of n9r)" = up/relay ] || fail "n1 reaches the relay-only n9r as $(path_of n9r), not up/relay"
 # The container has its own network namespace: every UDP socket there is the daemon's. IPv4
 # addresses in /proc are little-endian hex, so 127.x.y.z ends in 7F.
 pid=$(D9 inspect -f '{{.State.Pid}}' imesh-r)
 open=$(docker exec "$P-n9" sh -c "cat /proc/$pid/net/udp /proc/$pid/net/udp6" | awk '$2 ~ /:/ && !(length($2) == 13 && substr($2, 7, 2) == "7F") {print $2}')
 [ -z "$open" ] || fail "relay-only n9r has UDP sockets off loopback: $open"
-pass "--relay-only: n9r opens no UDP port but loopback, syncs, and n1 reaches it through the relay"
+pass "--relay-only: n9r opens no UDP port but loopback, has the roster, and n1 reaches it through the relay"
 $I rm n9d >/dev/null
 $I rm n9b >/dev/null
 $I rm n9r >/dev/null
@@ -639,7 +602,7 @@ echo "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["nam
 grep -q "imesh-tunnel-box.fake-$FAKE_DT_PORT" "$WORK/known_hosts" || fail "the host key is not under the tunnel alias"
 grep -q '^\[127.0.0.1\]' "$WORK/known_hosts" && fail "a host key was recorded for loopback"
 grep -q 'ssh_tunnel = "devtunnel:box.fake:' "$WORK/cfg/config.toml" || fail "the tunnel is not in the context"
-for i in $(seq 1 30); do [ "$($I status --jq '.[] | select(.name == "tbox") | .status.state')" = up ] && break; sleep 1; done
+for i in $(seq 1 60); do [ "$($I status --jq '.[] | select(.name == "tbox") | .status.state')" = up ] && break; sleep 1; done
 [ "$($I status --jq '.[] | select(.name == "tbox") | .status.state')" = up ] || fail "tbox is not up"
 pass "devtunnel://box.fake installed through the private tunnel with a checked host key, joined, and is up"
 
@@ -676,7 +639,7 @@ pass "rm reports removal, reset, context cleanup, and the alias it removed"
 docker exec "$P-n10" sh -c "rm -rf /home/ops/b; mkdir -p /home/ops/b; cp -r $KB/manifest.json $KB/targets $KB/imesh.zip /home/ops/b/; cp /home/ops/b/targets/$T/imesh /home/ops/b/imesh; chown -R ops:ops /home/ops/b; /usr/local/bin/imesh service uninstall --system"
 UP() { docker exec -u ops -w /home/ops "$P-n10" /home/ops/b/imesh "$@"; }
 out=$(UP up --service detached --json)
-echo "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["running"] and r["changed"] == ["cluster"] and r["cluster"] and r["members"] == 1, r' || fail "up (fresh): $out"
+echo "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["running"] and r["changed"] == ["cluster"] and r["cluster"] and r["members"] == 1 and r["recovery_code"], r' || fail "up (fresh): $out"
 id1=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 [ "$(UP up --jq '.changed | length')" = 0 ] || fail "a second up changed something"
 UP down >/dev/null
@@ -688,6 +651,16 @@ docker exec "$P-n10" grep -q 'IMESH_LABELS=role=test' /home/ops/.config/imesh/da
 UP -c n1 up >/dev/null 2>&1 && fail "up accepted --context"
 docker exec "$P-n10" test -f /home/ops/.local/share/imesh/bundle/imesh.zip || fail "up kept no bundle"
 pass "imesh up installs, starts a cluster, is idempotent, starts a stopped daemon, applies settings; update with the same bundle changes nothing"
+
+echo "== 28. recover with the code on stdin moves the owner to n3b and removes the old owner"
+$I -c n3 recover "$CODE" >/dev/null 2>&1 && fail "recover took the code from argv"
+echo "$CODE" | $I -c n3 recover >/dev/null
+[ "$(roles -c n3)" = "n3b=owner " ] || fail "roles on n3b after recover: $(roles -c n3)"
+$I -c n1 status >/dev/null 2>&1 || true
+removed_on n1 || { $I -c n1 dev call machine.inspect; fail "the old owner n1 does not report removed"; }
+out=$($I -c n1 promote n3b 2>&1) && fail "the old owner n1 still promotes: $out"
+echo "$out" | grep -q "refuse this one as removed" || fail "the old owner n1 refused the promote without saying it is removed: $out"
+pass "n3b is the owner; the old owner n1 reports removed and cannot promote ($(echo "$out" | tail -1))"
 
 echo "== 16. footprint"
 for n in n1 n4; do

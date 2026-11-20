@@ -1,56 +1,50 @@
-//! One link per member: an iroh connection on [`CORRO_ALPN`] that carries Corrosion's gossip
-//! (see [`crate::state::tunnel`]), a keepalive every second that decides whether the member is
-//! up, and this machine's tables.
+//! Roster sync. There are no standing links, so an idle cluster sends nothing.
 //!
-//! Each side sends its tables when the link starts and whenever they change, and applies what the
-//! other has and it lacks. Gossip passes in either direction only while both have the same tables
-//! and columns, so no row reaches a machine that cannot store it (see [`crate::state::schema`]).
-//! Gossip that the gate holds back is dropped; to Corrosion that looks like packet loss, and it
-//! sends again.
+//! A hello is one connection on [`ROSTER_ALPN`] with one stream: the dialer sends its roster, the
+//! other side merges it and answers with its own, and the dialer merges that. A machine says
+//! hello to every member when it starts, when its roster changes, and every [`RESYNC`]. When a
+//! member does not answer, the machine tries again after [`FIRST_RETRY`], then after twice as
+//! long each time, up to [`RESYNC`]. A
+//! machine that learns something from a hello changes its roster, so it tells everyone in turn,
+//! and a change reaches members that its signer cannot reach. `imesh status` says hello to every
+//! member, which also shows whether each one answers.
 //!
-//! Frame: length (4 bytes, big endian, kind and payload), kind (1 byte), payload.
+//! Each side first sends the 32-byte digest of its roster. When the digests match, the hello
+//! ends there, so the hellos that follow a change cost a few bytes each. Else each side sends a
+//! frame: length (4 bytes, big endian), then the roster as JSON. One hello per member runs at a
+//! time in each direction.
 
 use std::{
-    collections::HashMap,
-    convert::Infallible,
-    sync::Arc,
+    collections::BTreeMap,
+    sync::atomic::Ordering,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use bytes::Bytes;
+use anyhow::{Context, Result, anyhow, ensure};
 use iroh::{
     EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
-use n0_future::task::AbortOnDropHandle;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use super::Machine;
-use crate::state::{schema::Tables, slot, tunnel};
+use super::{Machine, admission::REMOVED};
+use crate::roster::{MAX_LOG, Roster};
 
-/// The ALPN that carries Corrosion's gossip between members.
-pub const CORRO_ALPN: &[u8] = b"imesh/corrosion/1";
-const KEEPALIVE_FRAME: u8 = 0;
-const GOSSIP_FRAME: u8 = 1;
-const TABLES_FRAME: u8 = 2;
-/// The largest frame: a table list can be larger than a datagram.
-const MAX_FRAME: usize = 4 << 20;
-/// Keepalives between two sends of this machine's tables when nothing changed.
-const TABLES_EVERY: u64 = 10;
-/// A member that sent nothing for this long is down.
-const LIVENESS: Duration = Duration::from_secs(4);
-const KEEPALIVE: Duration = Duration::from_secs(1);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// A failed link tries again after this long, doubling up to `MAX_BACKOFF`.
-const BACKOFF: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(4);
-/// Gossip frames that wait for one member's link.
-const QUEUE: usize = 1024;
+/// The ALPN that carries roster hellos between members.
+pub const ROSTER_ALPN: &[u8] = b"imesh/roster/0";
+/// How often a machine says hello to every member when nothing changed. A member that missed a
+/// change while it was down catches up at the latest then.
+const RESYNC: Duration = Duration::from_secs(600);
+/// How long a machine waits before it says hello again when a member did not answer. A new member
+/// is out of reach until its first hello brings its location, so this must not wait for
+/// [`RESYNC`].
+const FIRST_RETRY: Duration = Duration::from_secs(5);
+/// How long a burst of changes settles before the hellos go out.
+const SETTLE: Duration = Duration::from_millis(500);
+/// How long one hello may take, connect included.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,387 +65,282 @@ impl std::fmt::Display for PeerState {
     }
 }
 
+/// How the last hello with a member went.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub state: PeerState,
     pub path: Option<String>,
     pub rtt_ms: Option<u64>,
+    /// Unix seconds of the last hello that got an answer.
     pub last_seen: Option<u64>,
     pub error: Option<String>,
-    /// Whether Corrosion's SWIM layer counts the member as alive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub swim: Option<bool>,
-    /// `ok` when rows pass to and from the member; else why not, for example a schema conflict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
     /// In the devtunnel mesh: `forwarded` while this machine forwards the member's relay tunnel,
     /// `down` while that forward does not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
-}
-
-/// The link task to one member, its gossip queue, and what it last saw.
-pub(crate) struct Peer {
-    link: AbortOnDropHandle<()>,
-    queue: tunnel::Sender,
-    conn: Option<Connection>,
-    last_rx: Option<Instant>,
-    last_seen: Option<u64>,
-    error: Option<String>,
-    /// The member's tables, as it last sent them.
-    tables: Option<Arc<Tables>>,
-    /// Why this machine could not take the member's tables.
-    schema_error: Option<String>,
-    /// Set while this machine applies the member's tables.
-    catching_up: bool,
-}
-
-impl Peer {
-    fn new(link: AbortOnDropHandle<()>, queue: tunnel::Sender) -> Self {
-        Peer {
-            link,
-            queue,
-            conn: None,
-            last_rx: None,
-            last_seen: None,
-            error: None,
-            tables: None,
-            schema_error: None,
-            catching_up: false,
-        }
-    }
-
-    /// Whether a frame came from the member recently.
-    fn is_up(&self) -> bool {
-        self.last_rx.is_some_and(|t| t.elapsed() < LIVENESS)
-    }
-
-    fn state(&self) -> PeerState {
-        match (self.is_up(), self.last_rx) {
-            (true, _) => PeerState::Up,
-            (false, Some(_)) => PeerState::Down,
-            (false, None) if self.error.is_some() => PeerState::Down,
-            (false, None) => PeerState::Unknown,
-        }
-    }
+    /// The member refused this machine as removed.
+    #[serde(skip)]
+    pub(crate) refused_as_removed: bool,
 }
 
 impl Machine {
-    /// One link per member and per peer of a join in progress. The tunnel gets each link's queue.
-    pub(crate) fn reconcile_links(&self) {
-        let mut want = self.members();
-        want.extend(self.admission.bootstrap());
-        want.remove(&self.id());
-        let mut peers = self.peers.lock().unwrap();
-        if self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        peers.retain(|id, p| want.contains(id) && !p.link.is_finished());
-        self.incoming.lock().unwrap().retain(|id, _| want.contains(id));
-        for id in want {
-            peers.entry(id).or_insert_with(|| {
-                let (queue, rx) = mpsc::channel(QUEUE);
-                Peer::new(AbortOnDropHandle::new(tokio::spawn(self.clone().link(id, rx))), queue)
+    /// Says hello to every other member: now, on every roster change, and every [`RESYNC`]. After
+    /// a member did not answer, again with backoff.
+    pub(super) async fn sync_loop(self) {
+        let mut changes = self.store.subscribe();
+        let mut resync = tokio::time::interval(RESYNC);
+        let mut retry: Option<Duration> = None;
+        loop {
+            let retrying = async {
+                match retry {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let again = tokio::select! {
+                r = changes.changed() => if r.is_err() { return } else { false },
+                // A cut-off from refusals heals here: if the members still refuse this machine,
+                // the hellos set it again.
+                _ = resync.tick() => { self.cut_off.store(false, Ordering::Relaxed); false }
+                _ = retrying => true,
+            };
+            tokio::time::sleep(SETTLE).await;
+            changes.borrow_and_update();
+            let all = self.hello_all().await;
+            let missed = all.values().any(|s| s.state != PeerState::Up && !s.refused_as_removed);
+            retry = missed.then(|| match retry {
+                Some(d) if again => (d * 2).min(RESYNC),
+                _ => FIRST_RETRY,
             });
         }
-        // Two keys can share a gossip slot. The first one keeps it; the others carry no rows,
-        // and their status says why. A collision is never a silent overwrite.
-        let base = self.store.gossip_base;
-        let mine = slot(base, &self.id());
-        let mut queues: HashMap<u16, tunnel::Sender> = HashMap::new();
-        for (id, p) in peers.iter_mut() {
-            let s = slot(base, id);
-            if s == mine || queues.contains_key(&s) {
-                p.error =
-                    Some(format!("gossip port {s} collides with another member; reset this machine for a new key"));
-                continue;
+    }
+
+    /// Says hello to every other member at once, and waits for all of them.
+    pub(crate) async fn hello_all(&self) -> BTreeMap<EndpointId, PeerStatus> {
+        if self.cut_off.load(Ordering::Relaxed) {
+            return BTreeMap::new();
+        }
+        let me = self.id();
+        let peers: Vec<EndpointId> = self.members().into_iter().filter(|id| *id != me).collect();
+        let hellos = peers.into_iter().map(|id| {
+            let m = self.clone();
+            async move { (id, m.hello(id).await) }
+        });
+        let results = futures_util::future::join_all(hellos).await;
+        // A member with a hello that did not end has no answer in this round, so the round
+        // decides nothing about a cut-off.
+        let complete = results.iter().all(|(_, s)| s.is_some());
+        let all: BTreeMap<EndpointId, PeerStatus> =
+            results.into_iter().map(|(id, s)| (id, s.unwrap_or_else(|| self.peer_status(&id)))).collect();
+        // One member's word is not enough: a hostile member could refuse anyone as removed. Stop
+        // only when every member that answered refused this machine, and at least one did.
+        let answered: Vec<&PeerStatus> =
+            all.values().filter(|s| s.state == PeerState::Up || s.refused_as_removed).collect();
+        if complete && !answered.is_empty() && answered.iter().all(|s| s.refused_as_removed) {
+            warn!("every member that answered refused this machine as removed; it says hello to no one now");
+            self.cut_off.store(true, Ordering::Relaxed);
+        }
+        all
+    }
+
+    /// One hello with `peer`. Records how it went and returns that. When a hello to `peer` runs
+    /// already, waits for it and returns how it went instead, or nothing when it does not end.
+    async fn hello(&self, peer: EndpointId) -> Option<PeerStatus> {
+        if self.hellos.lock().unwrap().insert(peer) {
+            return Some(self.hello_owned(peer).await);
+        }
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        while self.hellos.lock().unwrap().contains(&peer) {
+            if Instant::now() > deadline {
+                return None;
             }
-            queues.insert(s, p.queue.clone());
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        self.tunnel.set_peers(queues);
+        Some(self.peer_status(&peer))
     }
 
-    fn set_peer(&self, id: EndpointId, f: impl FnOnce(&mut Peer)) {
-        if let Some(p) = self.peers.lock().unwrap().get_mut(&id) {
-            f(p);
+    /// A hello with `peer` that starts after any hello in flight to it ends, so it carries this
+    /// machine's roster as it is now.
+    pub(crate) async fn fresh_hello(&self, peer: EndpointId) -> PeerStatus {
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        while !self.hellos.lock().unwrap().insert(peer) {
+            if Instant::now() > deadline {
+                return PeerStatus {
+                    state: PeerState::Down,
+                    error: Some("a hello to this member did not end".into()),
+                    ..Default::default()
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        self.hello_owned(peer).await
     }
 
-    /// Whether gossip may pass to and from the member now.
-    fn rows_may_pass(&self, id: &EndpointId) -> bool {
-        let theirs = self.peers.lock().unwrap().get(id).and_then(|p| p.tables.clone());
-        theirs.is_some_and(|t| self.store.rows_may_pass(&t))
-    }
-
-    pub(super) fn link_up(&self, id: &EndpointId) -> bool {
-        self.peers.lock().unwrap().get(id).is_some_and(Peer::is_up)
-    }
-
-    /// The member's own connection to this machine, if it is open.
-    fn live_incoming(&self, peer: &EndpointId) -> Option<Connection> {
-        self.incoming.lock().unwrap().get(peer).filter(|c| c.close_reason().is_none()).cloned()
-    }
-
-    /// Forgets the member's connection to this machine if it is `conn`, and not a newer one.
-    fn forget_incoming(&self, peer: &EndpointId, conn: &Connection) {
-        let mut incoming = self.incoming.lock().unwrap();
-        if incoming.get(peer).is_some_and(|c| c.stable_id() == conn.stable_id()) {
-            incoming.remove(peer);
+    /// The hello itself, once this machine holds the member's single-flight slot.
+    async fn hello_owned(&self, peer: EndpointId) -> PeerStatus {
+        let started = Instant::now();
+        let r = tokio::time::timeout(HELLO_TIMEOUT, self.hello_once(peer))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("no answer within {HELLO_TIMEOUT:?}")));
+        self.hellos.lock().unwrap().remove(&peer);
+        let status = match r {
+            Ok(path) => PeerStatus {
+                state: PeerState::Up,
+                path: Some(path.into()),
+                rtt_ms: Some(started.elapsed().as_millis() as u64),
+                last_seen: Some(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                error: None,
+                tunnel: None,
+                refused_as_removed: false,
+            },
+            Err(e) => {
+                debug!(peer = %peer.fmt_short(), "hello: {e:#}");
+                let last_seen = self.peers.lock().unwrap().get(&peer).and_then(|p| p.last_seen);
+                PeerStatus {
+                    state: PeerState::Down,
+                    last_seen,
+                    error: Some(format!("{e:#}")),
+                    refused_as_removed: is_removed_reply(&e),
+                    ..Default::default()
+                }
+            }
+        };
+        let before = self.peers.lock().unwrap().insert(peer, status.clone()).map(|p| p.state);
+        // Say once when a member goes down or comes back, and why.
+        match (before, status.state) {
+            (Some(PeerState::Up), PeerState::Down) if !status.refused_as_removed => {
+                warn!(peer = %peer.fmt_short(), "member is down: {}", status.error.as_deref().unwrap_or(""));
+            }
+            (Some(PeerState::Down), PeerState::Up) => {
+                info!(peer = %peer.fmt_short(), path = status.path.as_deref().unwrap_or(""), "member is up again");
+            }
+            _ => {}
         }
+        status
     }
 
-    /// How this machine last saw member `id`.
+    async fn hello_once(&self, peer: EndpointId) -> Result<&'static str> {
+        let mine = self.store.roster().context("machine is not in a cluster")?;
+        let conn = self.dial(self.peer_addr(peer), ROSTER_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&mine.digest()).await?;
+        let mut theirs = [0u8; 32];
+        recv.read_exact(&mut theirs).await?;
+        if theirs != mine.digest() {
+            write_roster(&mut send, &mine).await?;
+            let theirs = read_roster(&mut recv).await?;
+            if self.store.merge(theirs, None).await? {
+                info!(peer = %peer.fmt_short(), "roster updated from a member");
+            }
+        }
+        send.finish()?;
+        let path = path_of(&conn);
+        conn.close(0u32.into(), b"done");
+        Ok(path)
+    }
+
+    /// How this machine last saw member `id`, with no new hello.
     pub fn peer_status(&self, id: &EndpointId) -> PeerStatus {
         if *id == self.id() {
             return PeerStatus { state: PeerState::Up, path: Some("self".into()), ..Default::default() };
         }
-        let swim = Some(self.store.swim_alive(id));
         let tunnel = self.mesh.status(id).map(|(_, ready)| if ready { "forwarded" } else { "down" }.to_string());
-        let peers = self.peers.lock().unwrap();
-        let Some(p) = peers.get(id) else {
-            return PeerStatus { swim, tunnel, ..Default::default() };
-        };
-        let schema = Some(match (&p.schema_error, &p.tables) {
-            (Some(e), _) => e.clone(),
-            (None, None) => "waiting for the member's tables".into(),
-            (None, Some(t)) if self.store.rows_may_pass(t) => "ok".into(),
-            (None, Some(_)) => "waiting for the member to take this machine's tables".into(),
-        });
-        let selected = p.conn.as_ref().filter(|_| p.is_up()).and_then(|c| {
-            let paths = c.paths();
-            paths.iter().find(|p| p.is_selected()).map(|p| (p.is_relay(), p.rtt()))
-        });
-        PeerStatus {
-            state: p.state(),
-            path: selected.map(|(relay, _)| if relay { "relay" } else { "direct" }.to_string()),
-            rtt_ms: selected.map(|(_, rtt)| rtt.as_millis() as u64),
-            last_seen: p.last_seen,
-            error: p.error.clone(),
-            swim,
-            schema,
-            tunnel,
-        }
-    }
-
-    /// Keeps a link to one member. Both members dial each other, so a pair stays linked even
-    /// when only one side can reach the other.
-    async fn link(self, peer: EndpointId, mut rx: mpsc::Receiver<Bytes>) {
-        let mut backoff = BACKOFF;
-        loop {
-            let Err(e) = self.link_once(peer, &mut rx).await;
-            if self.link_up(&peer) {
-                backoff = BACKOFF;
-            }
-            debug!(peer = %peer.fmt_short(), "link: {e:#}");
-            let mut dead = None;
-            self.set_peer(peer, |s| {
-                dead = s.conn.take();
-                s.error = Some(format!("{e:#}"));
-            });
-            // Close the failed connection, and forget it if the member opened it, so the next try
-            // dials instead of picking it again until iroh's idle timeout.
-            if let Some(c) = dead {
-                c.close(0u32.into(), b"link failed");
-                self.forget_incoming(&peer, &c);
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        }
-    }
-
-    /// A connection to the member: the member's own, or ours. A new member has no address in the
-    /// cluster state yet, so our dial may not get through while its own dial to us already has.
-    /// Whichever connection comes first carries the link.
-    async fn first_connection(&self, peer: EndpointId) -> Result<Connection> {
-        let dial = async {
-            let c = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(self.peer_addr(peer), CORRO_ALPN))
-                .await
-                .with_context(|| format!("no connection within {CONNECT_TIMEOUT:?}"))??;
-            tokio::spawn(self.clone().read_conn(peer, c.clone()));
-            anyhow::Ok(c)
-        };
-        let incoming = async {
-            loop {
-                if let Some(c) = self.live_incoming(&peer) {
-                    return c;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        };
-        tokio::select! {
-            biased;
-            c = incoming => Ok(c),
-            c = dial => c,
-        }
-    }
-
-    /// Sends this machine's tables, the member's queued gossip, and a keepalive every second.
-    async fn link_once(&self, peer: EndpointId, rx: &mut mpsc::Receiver<Bytes>) -> Result<Infallible> {
-        let conn = self.first_connection(peer).await?;
-        let mut send = conn.open_uni().await?;
-        self.set_peer(peer, |s| s.conn = Some(conn.clone()));
-        let mut tables = self.store.watch_tables();
-        let mine = tables.borrow_and_update().clone();
-        send_tables(&mut send, &mine).await?;
-        let started = Instant::now();
-        let mut no_path_since: Option<Instant> = None;
-        let mut tick = tokio::time::interval(KEEPALIVE);
-        let mut ticks = 0u64;
-        loop {
-            tokio::select! {
-                f = rx.recv() => {
-                    let f = f.context("link closed")?;
-                    if self.rows_may_pass(&peer) {
-                        write_frame(&mut send, GOSSIP_FRAME, &f).await?;
-                    }
-                }
-                _ = tables.changed() => {
-                    let mine = tables.borrow_and_update().clone();
-                    send_tables(&mut send, &mine).await?;
-                }
-                _ = tick.tick() => {
-                    write_frame(&mut send, KEEPALIVE_FRAME, &[]).await?;
-                    // Now and then send the tables again: a late frame from an older connection
-                    // may have left the member with an old copy.
-                    ticks += 1;
-                    if ticks.is_multiple_of(TABLES_EVERY) {
-                        let mine = tables.borrow().clone();
-                        send_tables(&mut send, &mine).await?;
-                    }
-                    // Try the member's tables again: an apply can fail for a passing reason.
-                    if !self.rows_may_pass(&peer) {
-                        self.retry_tables(peer);
-                    }
-                    // A restarted member dials us on a new connection while ours still looks open.
-                    if self.live_incoming(&peer).is_some_and(|c| c.stable_id() != conn.stable_id()) {
-                        return Err(anyhow!("member opened a newer connection"));
-                    }
-                    // iroh selects a path per member, not per connection, and changes it only
-                    // when a path opens or closes. When a restarted member comes back on a new
-                    // address, iroh can keep the dead address of a closed connection selected, so
-                    // this connection has no selected path and every new dial to the member goes
-                    // to the dead address. iroh forgets the selection when the member has no open
-                    // connection, so close this one and dial again.
-                    // A path can be unselected for a moment while iroh switches paths, so only a
-                    // connection with none for LIVENESS on end counts.
-                    if conn.paths().iter().any(|p| p.is_selected()) {
-                        no_path_since = None;
-                    } else if no_path_since.get_or_insert_with(Instant::now).elapsed() > LIVENESS {
-                        bail!("iroh selected no path to the member on this connection for {LIVENESS:?}");
-                    }
-                    // Writes into a dead connection succeed until its buffers fill, so silence decides.
-                    if started.elapsed() > 2 * LIVENESS && !self.link_up(&peer) {
-                        bail!("no frames from member for {LIVENESS:?}");
-                    }
-                }
-                _ = conn.closed() => bail!("connection closed"),
-            }
-        }
-    }
-
-    /// Reads frames from every stream the member opens on this connection.
-    async fn read_conn(self, peer: EndpointId, conn: Connection) {
-        while let Ok(mut recv) = conn.accept_uni().await {
-            let m = self.clone();
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                loop {
-                    if let Err(e) = read_frame(&mut recv, &mut buf).await {
-                        debug!(peer = %peer.fmt_short(), "link stream: {e:#}");
-                        break;
-                    }
-                    m.set_peer(peer, |s| {
-                        s.last_rx = Some(Instant::now());
-                        s.last_seen = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-                        s.error = None;
-                    });
-                    match buf[0] {
-                        GOSSIP_FRAME if m.rows_may_pass(&peer) => {
-                            if let Err(e) = m.tunnel.deliver(slot(m.store.gossip_base, &peer), &buf[1..]).await {
-                                debug!(peer = %peer.fmt_short(), "deliver: {e:#}");
-                            }
-                        }
-                        TABLES_FRAME => match serde_json::from_slice::<Tables>(&buf[1..]) {
-                            Ok(theirs) => m.take_tables(peer, Arc::new(theirs)),
-                            Err(e) => debug!(peer = %peer.fmt_short(), "bad tables frame: {e}"),
-                        },
-                        _ => {}
-                    }
-                }
-            });
-        }
-    }
-
-    /// Records a member's tables and applies what this machine lacks. Applying changes this
-    /// machine's tables, which the link then sends back, so both sides end up the same.
-    fn take_tables(&self, peer: EndpointId, theirs: Arc<Tables>) {
-        self.set_peer(peer, |s| s.tables = Some(theirs));
-        self.retry_tables(peer);
-    }
-
-    /// Starts a catch-up with the member's last tables in its own task, unless one runs. A
-    /// catch-up can take seconds on a large table; the reader keeps reading meanwhile.
-    fn retry_tables(&self, peer: EndpointId) {
-        let theirs = {
-            let mut peers = self.peers.lock().unwrap();
-            let Some(p) = peers.get_mut(&peer).filter(|p| !p.catching_up) else { return };
-            let Some(t) = p.tables.clone() else { return };
-            p.catching_up = true;
-            t
-        };
-        let m = self.clone();
-        tokio::spawn(async move { m.catch_up(peer, &theirs).await });
-    }
-
-    async fn catch_up(&self, peer: EndpointId, theirs: &Tables) {
-        let error = self.store.catch_up(theirs).await.err().map(|e| format!("{e:#}"));
-        self.set_peer(peer, |s| {
-            if error.is_some() && s.schema_error != error {
-                warn!(peer = %peer.fmt_short(), "cannot take the member's tables: {}", error.as_deref().unwrap_or_default());
-            }
-            s.schema_error = error;
-            s.catching_up = false;
-        });
+        let mut status = self.peers.lock().unwrap().get(id).cloned().unwrap_or_default();
+        status.tunnel = tunnel;
+        status
     }
 }
 
-/// Reads one frame into `buf`: the kind, then the payload.
-async fn read_frame(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<()> {
+/// Whether a member refused this machine because the roster removed it.
+fn is_removed_reply(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        let closed =
+            c.downcast_ref::<ConnectionError>().or_else(|| match c.downcast_ref::<iroh::endpoint::ConnectError>() {
+                Some(iroh::endpoint::ConnectError::Connection { source, .. }) => Some(source),
+                _ => None,
+            });
+        matches!(closed, Some(ConnectionError::ApplicationClosed(a)) if a.error_code == REMOVED.into())
+    })
+}
+
+fn path_of(conn: &Connection) -> &'static str {
+    match conn.paths().iter().find(|p| p.is_selected()) {
+        Some(p) if p.is_relay() => "relay",
+        Some(_) => "direct",
+        None => "unknown",
+    }
+}
+
+async fn write_roster(send: &mut SendStream, roster: &Roster) -> Result<()> {
+    let json = serde_json::to_vec(roster)?;
+    ensure!(json.len() <= MAX_LOG, "the roster has more than {MAX_LOG} bytes");
+    send.write_all(&(json.len() as u32).to_be_bytes()).await?;
+    send.write_all(&json).await?;
+    Ok(())
+}
+
+async fn read_roster(recv: &mut RecvStream) -> Result<Roster> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
-    ensure!(n > 0 && n <= MAX_FRAME, "bad frame length {n}");
-    buf.resize(n, 0);
-    recv.read_exact(buf).await?;
-    Ok(())
+    ensure!(n <= MAX_LOG, "a roster of {n} bytes is larger than {MAX_LOG}");
+    let mut buf = vec![0u8; n];
+    recv.read_exact(&mut buf).await?;
+    serde_json::from_slice(&buf).context("bad roster")
 }
 
-async fn send_tables(send: &mut SendStream, tables: &Tables) -> Result<()> {
-    write_frame(send, TABLES_FRAME, &serde_json::to_vec(tables)?).await
-}
-
-/// Writes one frame.
-async fn write_frame(send: &mut SendStream, kind: u8, payload: &[u8]) -> Result<()> {
-    let mut buf = Vec::with_capacity(5 + payload.len());
-    buf.extend_from_slice(&(1 + payload.len() as u32).to_be_bytes());
-    buf.push(kind);
-    buf.extend_from_slice(payload);
-    tokio::time::timeout(WRITE_TIMEOUT, send.write_all(&buf))
-        .await
-        .with_context(|| format!("member took no data for {WRITE_TIMEOUT:?}"))??;
-    Ok(())
-}
-
-/// Accepts a member's link connection and reads its frames.
+/// Answers a member's hello: merges its roster and sends back this machine's.
 #[derive(Debug, Clone)]
-pub(super) struct CorroProtocol(pub(super) Machine);
+pub(super) struct RosterProtocol(pub(super) Machine);
 
-impl ProtocolHandler for CorroProtocol {
+impl ProtocolHandler for RosterProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = conn.remote_id();
-        self.0.incoming.lock().unwrap().insert(peer, conn.clone());
-        self.0.clone().read_conn(peer, conn.clone()).await;
-        self.0.forget_incoming(&peer, &conn);
+        let m = &self.0;
+        if !m.answering.lock().unwrap().insert(peer) {
+            conn.close(0u32.into(), b"a hello from this member runs already");
+            return Ok(());
+        }
+        let r = async {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let mut theirs = [0u8; 32];
+            recv.read_exact(&mut theirs).await?;
+            let mine = m.store.roster().context("machine is not in a cluster")?;
+            send.write_all(&mine.digest()).await?;
+            if theirs != mine.digest() {
+                let theirs = read_roster(&mut recv).await?;
+                if m.store.merge(theirs, None).await? {
+                    info!(peer = %peer.fmt_short(), "roster updated from a member");
+                }
+                let mine = m.store.roster().context("machine is not in a cluster")?;
+                write_roster(&mut send, &mine).await?;
+            }
+            send.finish()?;
+            // A member that said hello is up. Else this machine keeps its own failed hello, and
+            // its backoff, as the last word until the next retry.
+            if m.store.read(|s| s.is_member(&peer)) {
+                let last_seen = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                m.peers.lock().unwrap().insert(
+                    peer,
+                    PeerStatus {
+                        state: PeerState::Up,
+                        path: Some(path_of(&conn).into()),
+                        last_seen: Some(last_seen),
+                        ..Default::default()
+                    },
+                );
+            }
+            // The dialer closes once it has the answer.
+            let _ = tokio::time::timeout(HELLO_TIMEOUT, conn.closed()).await;
+            anyhow::Ok(())
+        };
+        let r = tokio::time::timeout(HELLO_TIMEOUT, r)
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("the hello did not end within {HELLO_TIMEOUT:?}")));
+        m.answering.lock().unwrap().remove(&peer);
+        if let Err(e) = r {
+            debug!(peer = %peer.fmt_short(), "hello from member: {e:#}");
+        }
         Ok(())
     }
 }

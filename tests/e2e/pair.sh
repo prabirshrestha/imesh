@@ -81,19 +81,15 @@ INVITE=
 grep -q "n2 .* is in cluster" "$WORK/invite.out" || fail "invite printed no result: $(cat "$WORK/invite.out")"
 pass "invite and join both report success"
 
-echo "== 5. n2 is a member and kv syncs both ways"
+echo "== 5. n1 and n2 list each other up with their roles"
 for i in $(seq 1 30); do
-	s=$($I -c n1 status | awk '$1=="n2"{print $3}')
-	[ "$s" = up ] && break
+	s=$($I -c n1 status | awk '$1=="n2"{print $3"/"$4}')
+	[ "$s" = member/up ] && break
 	sleep 1
 done
-[ "$s" = up ] || { $I -c n1 status; fail "n2 not up in n1's status"; }
-$I -c n1 kv set from1 a >/dev/null
-for i in $(seq 1 20); do [ "$(UP kv get from1 2>/dev/null)" = a ] && break; sleep 0.5; done
-[ "$(UP kv get from1)" = a ] || fail "n1 -> n2 kv not synced"
-UP kv set from2 b >/dev/null
-for i in $(seq 1 20); do [ "$($I -c n1 kv get from2 2>/dev/null)" = b ] && break; sleep 0.5; done
-[ "$($I -c n1 kv get from2)" = b ] || fail "n2 -> n1 kv not synced"
-pass "n2 up in n1's status; kv synced both ways"
+[ "$s" = member/up ] || { $I -c n1 status; fail "n2 not a member that is up in n1's status: $s"; }
+s=$(UP status | awk '$1=="n1"{print $3"/"$4}')
+[ "$s" = owner/up ] || { UP status; fail "n1 not an owner that is up in n2's status: $s"; }
+pass "n1 lists n2 as a member that is up; n2 lists n1 as the owner that is up"
 
 echo "ALL PASS"

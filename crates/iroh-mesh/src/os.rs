@@ -78,8 +78,12 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
-    // Make the rename itself durable, so a written file survives a power loss.
-    crate::platform::sync_dir(dir)?;
+    // Make the rename itself durable, so a written file survives a power loss. The file has the
+    // new data now, so a failure here is no failure of the write: a caller that undid its change
+    // on an error would disagree with the file.
+    if let Err(e) = crate::platform::sync_dir(dir) {
+        tracing::warn!(dir = %dir.display(), "the write may not survive a power loss: {e:#}");
+    }
     Ok(())
 }
 

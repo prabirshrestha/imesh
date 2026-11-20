@@ -62,7 +62,7 @@ winps() {
 	else
 		local enc
 		enc=$({ prelude; cat; } | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')
-		timeout "${WINPS_TIMEOUT:-240}" ssh -o BatchMode=yes "$WIN" "powershell -NoProfile -NonInteractive -EncodedCommand $enc" 2>&1 | grep -v 'CLIXML\|<Objs'
+		timeout "${WINPS_TIMEOUT:-240}" ssh -o BatchMode=yes "$WIN" "powershell -NoProfile -NonInteractive -EncodedCommand $enc" 2>&1 | { grep -v 'CLIXML\|<Objs' || true; }
 	fi
 }
 
@@ -78,14 +78,14 @@ copy_exe() {
 }
 
 echo "work dir $WORK"
-# Test the example app, built as any app is (iroh_mesh_cli::run plus its own tables and methods), when
+# Test the example app, built as any app is (iroh_mesh_cli::run plus its own ALPN and methods), when
 # the crate has one; a prototype without it uses its plain binary.
 if [ -f "$CRATE/examples/app.rs" ]; then BUILD="--example app"; OUT=examples/app; else BUILD=; OUT=imesh; fi
-(cd "$CRATE" && cargo build -q $BUILD && cargo zigbuild -q --release --target aarch64-unknown-linux-musl $BUILD &&
-	cargo build -q --release --target x86_64-pc-windows-gnu $BUILD)
-I=$TARGET/debug/$OUT
+# The CLI under test runs from a bundle with this host, the Linux nodes, and Windows.
+HOST=$(rustc -vV | sed -n 's/^host: //p')
+(cd "$ROOT" && cargo x build $BUILD --target "$HOST" --target aarch64-unknown-linux-musl --target x86_64-pc-windows-gnu)
+I=$ROOT/dist/imesh/imesh
 export IMESH_SOCKET=$WORK/no-local-daemon.sock IMESH_CONFIG_DIR=$WORK/cfg IMESH_SSH_CONFIG=$WORK/ssh_config IMESH_LOG=warn
-export IMESH_BINARY_AARCH64=$TARGET/aarch64-unknown-linux-musl/release/$OUT
 
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/id" -C imesh-win
 cat >"$WORK/ssh_config" <<EOF
@@ -132,7 +132,7 @@ EOF
 $I invite win01 --devtunnel --yes >"$WORK/invite.out" 2>&1 &
 inv=$!
 for i in $(seq 1 60); do
-	code=$(grep -o 'imesh up --join [^ ]*' "$WORK/invite.out" | awk '{print $4}')
+	code=$(grep -o 'imesh up --join [^ ]*' "$WORK/invite.out" | awk '{print $4}' || true)
 	[ -n "$code" ] && break
 	sleep 1
 done
@@ -140,10 +140,10 @@ done
 out=$(winps <<EOF
 & \$src up --join $code --label os=windows @relayArgs
 EOF
-)
+) || fail "up --join on Windows: $out"
 wait "$inv" || fail "invite: $(cat "$WORK/invite.out")"
 for i in $(seq 1 30); do
-	s=$($I status | awk '$1=="win01"{print $3"/"$4}')
+	s=$($I status | awk '$1=="win01"{print $4"/"$5}')
 	case $s in up/*) break ;; esac
 	sleep 1
 done
@@ -151,26 +151,24 @@ $I status
 case $s in up/*) ;; *) fail "win01 not up: $s; up printed: $out" ;; esac
 pass "win01 ran up as a scheduled task and joined with a pairing code, path ${s#up/}"
 
-echo "== W4. data both ways, forwarding, app ALPN"
-WID=$($I dev call machine.inspect -m win01 | awk -F'"' '/"id"/{print $4; exit}')
-$I kv set to-win from-linux >/dev/null
-for i in $(seq 1 20); do [ "$($I dev call kv.get '{"key":"to-win"}' -m win01)" = '"from-linux"' ] && break; sleep 0.5; done
-[ "$($I dev call kv.get '{"key":"to-win"}' -m win01)" = '"from-linux"' ] || fail "Linux write not on Windows"
-winps <<'EOF' >/dev/null
-& (Join-Path $env:LOCALAPPDATA 'imesh\bin\imesh.exe') kv set to-lin from-windows
+echo "== W4. status both ways, forwarding, app ALPN"
+WID=$($I dev call machine.inspect -m win01 | awk -F'"' '/"id"/ && !n++ {print $4}')
+[ -n "$WID" ] || fail "machine.inspect forwarded to win01"
+out=$(winps <<'EOF'
+& (Join-Path $env:LOCALAPPDATA 'imesh\bin\imesh.exe') status
 EOF
-for i in $(seq 1 20); do [ "$($I dev call kv.get '{"key":"to-lin"}' -m lin2)" = '"from-windows"' ] && break; sleep 0.5; done
-[ "$($I dev call kv.get '{"key":"to-lin"}' -m lin2)" = '"from-windows"' ] || fail "Windows write not on Linux"
+)
+echo "$out" | awk '$1=="lin2"{print $3"/"$4}' | grep -q '^member/up$' || fail "Windows does not see lin2 up: $out"
 $I dev call example.dial "{\"to\":\"$WID\",\"text\":\"hi\"}" | grep -q '"echo": "hi"' || fail "app ALPN to Windows"
 $I ping win01 -n 1 >/dev/null || fail "ping win01"
-pass "sync both ways, forwarded calls, app ALPN, ping win01"
+pass "win01 sees lin2 up, forwarded calls, app ALPN, ping win01"
 
 echo "== W5. Linux joins through the authenticated devtunnel CLI and win01 relay"
 if [ -n "${SKIP_W5:-}" ]; then
 	echo "SKIP W5 (SKIP_W5 is set)"
 else
 for i in $(seq 1 60); do
-	url=$($I relay ls | awk -F'"' '/"url"/{print $4; exit}')
+	url=$($I relay ls | awk -F'"' '/"url"/ && !n++ {print $4}')
 	[ -n "$url" ] && break
 	sleep 2
 done
@@ -185,16 +183,13 @@ $I relay set "$url" >/dev/null
 sleep 20
 $I add "root@localhost:${PB}03" --relay-only --devtunnel "devtunnel:$DEVTUNNEL_ID:3340" >/dev/null
 for i in $(seq 1 40); do
-	s=$($I -c lin3 status 2>/dev/null | awk '$1=="win01"{print $3"/"$4}' || true)
+	s=$($I -c lin3 status 2>/dev/null | awk '$1=="win01"{print $4"/"$5}' || true)
 	[ "$s" = up/relay ] && break
 	sleep 1
 done
 [ "$s" = up/relay ] || fail "lin3 does not see win01 over the relay: $s"
-$I kv set tunnel ok >/dev/null
-for i in $(seq 1 20); do [ "$($I -c lin3 kv get tunnel)" = ok ] && break; sleep 0.5; done
-[ "$($I -c lin3 kv get tunnel)" = ok ] || fail "lin3 did not sync"
 $I -c lin3 status
-pass "lin3 joined and synced through $url"
+pass "lin3 joined and reaches win01 through $url"
 fi
 
 echo "== W6. Windows footprint"

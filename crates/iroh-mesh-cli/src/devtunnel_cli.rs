@@ -13,6 +13,9 @@ pub async fn check_devtunnel() -> Result<()> {
     check_devtunnel_at(&devtunnel_cli()).await
 }
 
+/// The devtunnel CLI: from the PATH, else, on Unix, from the PATH of the user's login shell. A
+/// command over SSH and a service have a shorter PATH than a login shell: Microsoft's Linux
+/// installer puts the CLI in `~/bin`, which only `~/.profile` adds.
 pub fn devtunnel_cli() -> PathBuf {
     let name = if cfg!(windows) { "devtunnel.exe" } else { "devtunnel" };
     std::env::var_os("PATH")
@@ -20,8 +23,31 @@ pub fn devtunnel_cli() -> PathBuf {
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .map(|p| p.join(name))
         .find(|p| p.is_file())
+        .or_else(from_login_shell)
         .and_then(|p| p.canonicalize().ok())
         .unwrap_or_else(|| name.into())
+}
+
+/// `devtunnel` as the user's shell finds it, with its profile and rc files, as in a terminal.
+/// A shell that is not POSIX may reject `command -v`, so `/bin/sh` tries after it.
+fn from_login_shell() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let shell = std::env::var_os("SHELL").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    [(shell, "-ilc"), ("/bin/sh".into(), "-lc")].into_iter().find_map(|(shell, flags)| {
+        let out = std::process::Command::new(shell)
+            .args([flags, "command -v devtunnel"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        // An rc file may print other lines; the path is the line that names a file.
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| PathBuf::from(l.trim()))
+            .find(|p| p.is_absolute() && p.is_file())
+    })
 }
 
 pub async fn check_devtunnel_at(cli: &Path) -> Result<()> {

@@ -61,14 +61,16 @@ fn install_task(exe: &Path, env: &Env, copy: bool) -> Result<()> {
 $exe = '{exe}'
 $log = '{log}'
 $a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless `"$exe`" service run --log-file `"$log`"{home}"
-$t = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+# The account of this process. USERDOMAIN is WORKGROUP in an SSH session, which names no account.
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$t = New-ScheduledTaskTrigger -AtLogOn -User $me
 $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 9999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
 try {{
-  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+  $p = New-ScheduledTaskPrincipal -UserId $me -LogonType S4U -RunLevel Limited
   Register-ScheduledTask -TaskName imesh -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null
   'registered imesh task (runs without a logon session)'
 }} catch {{
-  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+  $p = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName imesh -Action $a -Trigger $t -Settings $s -Principal $p -Force | Out-Null
   'registered imesh task (runs while the user is logged on)'
 }}

@@ -1,4 +1,4 @@
-//! The machine daemon: one iroh endpoint, the local API, and one link to every other member.
+//! The machine daemon: one iroh endpoint, the local API, and roster sync with the other members.
 
 mod admission;
 mod cluster;
@@ -27,17 +27,13 @@ use tracing::{info, warn};
 pub(crate) use admission::Admission;
 pub use admission::Caller;
 pub use cluster::valid_name as valid_member_name;
-use links::CorroProtocol;
-pub use links::{CORRO_ALPN, PeerState, PeerStatus};
+use links::RosterProtocol;
+pub use links::{PeerState, PeerStatus, ROSTER_ALPN};
 use machine::ApiProtocol;
 pub use machine::{Inner, Machine};
 
 pub use crate::net::local::Access;
-use crate::{
-    api::API_ALPN,
-    net,
-    state::{Store, slot, store_dir, tunnel::Tunnel},
-};
+use crate::{api::API_ALPN, net, state::Store};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const KEY_FILE: &str = "secret.key";
@@ -45,7 +41,7 @@ pub const KEY_FILE: &str = "secret.key";
 /// What a machine needs to start. Only `data_dir` has no default: see [`Config::new`].
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Where the machine key and database live. Only one machine at a time may use it.
+    /// Where the machine key and roster live. Only one machine at a time may use it.
     pub data_dir: PathBuf,
     /// Machine name. Defaults to the hostname.
     pub name: Option<String>,
@@ -81,7 +77,6 @@ pub struct Builder {
     methods: BTreeMap<String, Method>,
     protocols: Vec<(Vec<u8>, ProtocolFactory)>,
     openable: std::collections::BTreeSet<Vec<u8>>,
-    schema: Vec<String>,
 }
 
 impl Builder {
@@ -91,17 +86,7 @@ impl Builder {
             methods: BTreeMap::new(),
             protocols: Vec::new(),
             openable: Default::default(),
-            schema: Vec::new(),
         })
-    }
-
-    /// Adds app tables: complete `CREATE TABLE` and `CREATE INDEX` statements. Every machine that
-    /// runs this binary applies them at start, and refuses to start if they do not apply. A new
-    /// version of the app may add tables and columns (nullable, or with a default) and indexes;
-    /// it cannot drop or change them. Name app tables after the app, not `imesh_*`.
-    pub fn schema(mut self, sql: &str) -> Self {
-        self.schema.push(sql.to_string());
-        self
     }
 
     /// Adds an API method, callable from the CLI and from other machines. The method gets the
@@ -122,7 +107,7 @@ impl Builder {
     }
 
     /// Adds an app protocol whose handler needs the machine: its endpoint (for example for
-    /// iroh-blobs or iroh-docs), its state, or its members. `make` runs after the endpoint binds
+    /// iroh-blobs or iroh-docs), or its members. `make` runs after the endpoint binds
     /// and before the router starts.
     pub fn protocol_with<H: ProtocolHandler>(
         mut self,
@@ -141,11 +126,11 @@ impl Builder {
         self
     }
 
-    /// Starts the machine: the endpoint and its protocols, sync with the other members, the
-    /// database, and the relay when `serve_relay` is set. It does not open the local API;
+    /// Starts the machine: the endpoint and its protocols, roster sync with the other members, and
+    /// the relay when `serve_relay` is set. It does not open the local API;
     /// [`serve`] does that. Fails if another machine uses the data directory.
     pub async fn spawn(self) -> Result<Running> {
-        // The database runs blocking SQLite calls in place, which needs worker threads.
+        // The API and the hellos run in parallel tasks.
         anyhow::ensure!(
             tokio::runtime::Handle::current().runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
             "imesh needs a multi-thread tokio runtime"
@@ -159,11 +144,9 @@ impl Builder {
         };
         crate::os::create_private_dir(&config.data_dir)?;
         let lock = lock_data_dir(&config.data_dir)?;
+        remove_old_store(&config.data_dir);
         let secret = crate::os::load_or_create_key(&config.data_dir.join(KEY_FILE))?;
-        let me = secret.public();
-        remove_old_stores(&config.data_dir, Some(&me));
-        let base = config.net.gossip_port_base.unwrap_or(crate::state::GOSSIP_PORT_BASE);
-        let store = Store::start(&store_dir(&config.data_dir, &me), &me, base, &self.schema).await?;
+        let store = Store::open(&config.data_dir)?;
         let admission = Admission::new(store.clone());
         let lookup = MemoryLookup::new();
         let (initial, custom) = initial_relays(&config.net);
@@ -178,9 +161,9 @@ impl Builder {
             methods: self.methods,
             openable: self.openable,
             peers: Default::default(),
-            incoming: Default::default(),
-            tunnel: Tunnel::new(slot(base, &me)),
-            stopped: Default::default(),
+            cut_off: Default::default(),
+            hellos: Default::default(),
+            answering: Default::default(),
             exposed: tokio::sync::watch::channel(None).0,
             mesh: mesh::Mesh::new(devtunnel_cli),
             relays: tokio::sync::Mutex::new(initial.clone()),
@@ -191,13 +174,16 @@ impl Builder {
         }));
         let mut router = Router::builder(endpoint.clone())
             .accept(API_ALPN, ApiProtocol(machine.clone()))
-            .accept(CORRO_ALPN, CorroProtocol(machine.clone()));
+            .accept(ROSTER_ALPN, RosterProtocol(machine.clone()));
         for (alpn, make) in self.protocols {
             router = router.accept(alpn, make(&machine));
         }
         let router = router.spawn();
         let (relay, tunnel) = machine.serve_relay().await?;
-        let mut tasks = vec![AbortOnDropHandle::new(tokio::spawn(machine.clone().background()))];
+        let mut tasks = vec![
+            AbortOnDropHandle::new(tokio::spawn(machine.clone().background())),
+            AbortOnDropHandle::new(tokio::spawn(machine.clone().sync_loop())),
+        ];
         tasks.extend(tunnel);
         tasks.extend(forwarding);
         info!(id = %machine.id(), name = %machine.name, "machine started");
@@ -245,7 +231,7 @@ async fn bind_endpoint(
 }
 
 /// A started machine. Dropping it stops its tasks. Call [`Running::shutdown`] to also close the
-/// connections and stop the database agent.
+/// connections.
 pub struct Running {
     pub machine: Machine,
     router: Router,
@@ -262,8 +248,8 @@ impl Running {
         let _ = self.machine.reset.subscribe().wait_for(|r| *r).await;
     }
 
-    /// Stops the relay, the endpoint, and the database agent. Runs every step, and returns the
-    /// first error. Committed writes are already in the database.
+    /// Stops the relay and the endpoint. Runs every step, and returns the first error. Every
+    /// roster change is already saved.
     pub async fn shutdown(mut self) -> Result<()> {
         self.stop().await
     }
@@ -275,16 +261,12 @@ impl Running {
             None => Ok(()),
         };
         let router = self.router.shutdown().await.map_err(anyhow::Error::from);
-        self.machine.tunnel.close();
         self.machine.mesh.clear();
-        self.machine.store.shutdown().await;
         relay.and(router)
     }
 
-    /// Deletes `<data dir>/app`, where apps keep their own files, then the key. The key goes
-    /// last, so a failure leaves the old identity and the reset can run again. The database
-    /// directory carries the key, so the next machine never opens it; it is removed now if it
-    /// can be, and at the next start otherwise (Windows keeps open files).
+    /// Deletes `<data dir>/app`, where apps keep their own files, then the roster, then the key.
+    /// The key goes last, so a failure leaves the old identity and the reset can run again.
     pub fn delete_data(data_dir: &Path) -> Result<()> {
         let dir = data_dir;
         let gone = |r: std::io::Result<()>, what: &Path| match r {
@@ -295,11 +277,32 @@ impl Running {
         };
         let app = dir.join("app");
         gone(std::fs::remove_dir_all(&app), &app)?;
+        let roster = dir.join(crate::roster::FILE);
+        gone(std::fs::remove_file(&roster), &roster)?;
         let key = dir.join(KEY_FILE);
         gone(std::fs::remove_file(&key), &key)?;
-        remove_old_stores(dir, None);
         Ok(())
     }
+}
+
+/// Deletes the folders that a machine of the old replicated store left, named `corrosion-` and the
+/// 64 hex digits of the machine id. Nothing is converted: the roster starts from its own file. A
+/// folder that cannot be deleted is only logged. Remove this after one release.
+fn remove_old_store(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() && is_old_store(&e.file_name().to_string_lossy()) {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => info!(path = %path.display(), "deleted the old store"),
+                Err(err) => warn!(path = %path.display(), "cannot delete the old store: {err}"),
+            }
+        }
+    }
+}
+
+fn is_old_store(name: &str) -> bool {
+    name.strip_prefix("corrosion-").is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Takes the data directory's lock file for this process. The OS releases it when the process
@@ -316,30 +319,8 @@ fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
     }
 }
 
-/// Removes the database directories of this machine's earlier identities: all but `keep`'s.
-fn remove_old_stores(data_dir: &Path, keep: Option<&iroh::EndpointId>) {
-    let keep = keep.map(|id| store_dir(data_dir, id));
-    let Ok(entries) = std::fs::read_dir(data_dir) else { return };
-    for e in entries.flatten() {
-        let path = e.path();
-        if Some(&path) != keep.as_ref() && e.file_name().to_string_lossy().starts_with("corrosion-") {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => info!(path = %path.display(), "removed the database of an earlier identity"),
-                Err(err) => warn!(path = %path.display(), "cannot remove old database yet: {err}"),
-            }
-        }
-    }
-}
-
 impl Drop for Running {
     fn drop(&mut self) {
-        // Link tasks hold the machine, and the machine holds their handles. Break the cycle,
-        // and start no new links.
-        let mut peers = self.machine.peers.lock().unwrap();
-        self.machine.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-        peers.clear();
-        self.machine.incoming.lock().unwrap().clear();
-        self.machine.tunnel.close();
         self.machine.mesh.clear();
     }
 }
@@ -352,7 +333,7 @@ enum Exit {
 }
 
 /// Runs a machine and its local API until `shutdown` resolves. After `machine.reset` it deletes
-/// the key, the database, and `<data dir>/app`, and starts again as a new machine from `make()`.
+/// the key, the roster, and `<data dir>/app`, and starts again as a new machine from `make()`.
 pub async fn serve(make: impl Fn() -> Builder, api: &LocalApi, shutdown: impl Future<Output = ()>) -> Result<()> {
     tokio::pin!(shutdown);
     while run(make(), api, shutdown.as_mut()).await? == Exit::Reset {
@@ -398,4 +379,26 @@ async fn run(builder: Builder, api: &LocalApi, shutdown: Pin<&mut impl Future<Ou
         stopped?;
     }
     Ok(exit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_store_folders_are_deleted_and_other_files_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join(format!("corrosion-{}", "ab".repeat(32)));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("state.db"), b"x").unwrap();
+        let other = dir.path().join("corrosion-notes");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("key"), b"k").unwrap();
+        remove_old_store(dir.path());
+        assert!(!old.exists());
+        assert!(other.exists(), "only the exact old name goes");
+        assert!(dir.path().join("app").exists());
+        assert!(dir.path().join("key").exists());
+    }
 }

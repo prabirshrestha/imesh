@@ -20,22 +20,20 @@ use n0_future::task::AbortOnDropHandle;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use super::{
-    Admission, Caller, Config, Method, VERSION,
-    links::{Peer, PeerState},
-};
+use super::{Admission, Caller, Config, Method, VERSION, links::PeerStatus};
 use crate::{
     api::{self, API_ALPN, Reply, Request},
     net::{self, Relays},
-    state::{MachineInfo, Snapshot, Store, tunnel::Tunnel},
+    roster::{Change, Location},
+    state::{MachineInfo, Snapshot, Store},
 };
 
+/// The file in the data directory that keeps the mesh relay port between runs.
+const MESH_PORT_FILE: &str = "mesh-port";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often the background loop runs without a change, to steer SWIM.
-const TICK: Duration = Duration::from_secs(2);
-/// How often expired `kv` keys are deleted.
-const KV_EXPIRE_EVERY: Duration = Duration::from_secs(60);
+/// How long an address change settles before this machine signs where it is now.
+const ADDR_SETTLE: Duration = Duration::from_secs(2);
 
 /// A running machine. Apps get it in their methods and protocols.
 #[derive(Clone)]
@@ -57,12 +55,15 @@ pub struct Inner {
     pub(crate) admission: Admission,
     pub(crate) lookup: MemoryLookup,
 
-    // Links to members (see `links.rs`).
-    pub(crate) peers: Mutex<BTreeMap<EndpointId, Peer>>,
-    /// The latest link connection each member opened to us.
-    pub(crate) incoming: Mutex<BTreeMap<EndpointId, Connection>>,
-    /// Carries Corrosion's gossip between this machine's loopback and the member links.
-    pub(crate) tunnel: Tunnel,
+    // Roster sync (see `links.rs`).
+    /// How the last hello with each member went.
+    pub(crate) peers: Mutex<BTreeMap<EndpointId, PeerStatus>>,
+    /// Set when every member that answered refused this machine as removed. It then says hello
+    /// to no one.
+    pub(crate) cut_off: std::sync::atomic::AtomicBool,
+    /// Members this machine says hello to now, and members whose hello it answers now.
+    pub(crate) hellos: Mutex<BTreeSet<EndpointId>>,
+    pub(crate) answering: Mutex<BTreeSet<EndpointId>>,
 
     // Relays.
     /// The relays the endpoint started with. Used again when the cluster setting is cleared.
@@ -77,8 +78,6 @@ pub struct Inner {
     pub(crate) mesh: super::mesh::Mesh,
 
     // Lifecycle.
-    /// Set, under the `peers` lock, when the machine stops.
-    pub(crate) stopped: std::sync::atomic::AtomicBool,
     /// Set by `machine.reset`. [`Running::reset_requested`] waits for it.
     pub(crate) reset: tokio::sync::watch::Sender<bool>,
     /// Set by the `machine.reset` method: reset once its reply has left.
@@ -103,7 +102,7 @@ impl Machine {
         self.endpoint.id()
     }
 
-    /// The replicated database. Apps query and write their own tables with it.
+    /// This machine's copy of the roster.
     pub fn state(&self) -> &Store {
         &self.store
     }
@@ -163,7 +162,7 @@ impl Machine {
         self.store.read(Snapshot::active_members)
     }
 
-    /// Opens a connection to another member on any ALPN. Addresses come from the cluster state.
+    /// Opens a connection to another member on any ALPN. Addresses come from the roster.
     pub async fn connect(&self, to: EndpointId, alpn: &[u8]) -> Result<Connection> {
         ensure!(self.members().contains(&to), "{} is not a member", to.fmt_short());
         self.dial(self.peer_addr(to), alpn).await
@@ -171,10 +170,15 @@ impl Machine {
 
     pub(crate) async fn dial(&self, addr: EndpointAddr, alpn: &[u8]) -> Result<Connection> {
         let id = addr.id;
-        tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(addr, alpn))
+        let tried = format!("{:?}", addr.addrs);
+        let r = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(addr, alpn))
             .await
-            .map_err(|_| anyhow!("connect to {} timed out", id.fmt_short()))?
-            .with_context(|| format!("connect to {}", id.fmt_short()))
+            .map_err(|_| anyhow!("connect to {} timed out", id.fmt_short()))
+            .and_then(|c| c.with_context(|| format!("connect to {}", id.fmt_short())));
+        if let Err(e) = &r {
+            warn!(peer = %id.fmt_short(), %tried, "dial failed: {e:#}");
+        }
+        r
     }
 
     /// Waits until the home relay is connected, so our address includes the relay URL.
@@ -184,7 +188,7 @@ impl Machine {
         }
     }
 
-    /// What this machine publishes about itself in `imesh_machines`.
+    /// What this machine says about itself in the roster.
     pub fn info(&self) -> MachineInfo {
         MachineInfo {
             name: self.name.clone(),
@@ -198,15 +202,27 @@ impl Machine {
         }
     }
 
+    /// The loopback port of this machine's mesh relay. An explicit `--mesh-port` is used as it is,
+    /// and the relay fails to start when it is in use. Else the port of the last run when it is
+    /// free, else 0: the system picks a free port. Machines may use the same port or not, and a
+    /// clash never needs a person.
+    fn mesh_relay_port(&self) -> u16 {
+        if let Some(port) = self.config.net.mesh_port {
+            return port;
+        }
+        std::fs::read_to_string(self.store.dir().join(MESH_PORT_FILE))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port)).is_ok())
+            .unwrap_or(0)
+    }
+
     /// Runs the embedded relay when `--serve-relay` is set, and exposes it when asked.
     pub(super) async fn serve_relay(
         &self,
     ) -> Result<(Option<iroh_relay::server::Server>, Option<AbortOnDropHandle<()>>)> {
         let r = &self.config.net;
-        let mesh_addr = r.devtunnel_mesh.then(|| {
-            let port = r.mesh_port.unwrap_or_else(|| net::devtunnel::mesh_port(&self.id()));
-            std::net::SocketAddr::from(([127, 0, 0, 1], port))
-        });
+        let mesh_addr = r.devtunnel_mesh.then(|| std::net::SocketAddr::from(([127, 0, 0, 1], self.mesh_relay_port())));
         let Some(addr) = r.serve_relay.or(mesh_addr) else { return Ok((None, None)) };
         let gate =
             net::relay::Gate { me: self.id(), token: r.serve_relay_token.clone(), admission: self.admission.clone() };
@@ -218,6 +234,13 @@ impl Machine {
         })?;
         if let Some(service) = server.relay_service() {
             self.admission.set_relay_clients(service.clients().clone());
+        }
+        if r.devtunnel_mesh
+            && r.mesh_port.is_none()
+            && r.serve_relay.is_none()
+            && let Some(a) = server.http_addr()
+        {
+            let _ = std::fs::write(self.store.dir().join(MESH_PORT_FILE), a.port().to_string());
         }
         let how = r.expose_relay.clone().or(r.devtunnel_mesh.then_some(net::Expose::DevTunnel { id: None }));
         let tunnel = how.map(|how| {
@@ -234,28 +257,23 @@ impl Machine {
         Ok((Some(server), tunnel))
     }
 
-    /// Publishes our own record, keeps links, learns peer addresses, enforces removal, and steers
-    /// SWIM.
+    /// Learns member addresses, enforces removal, follows the cluster relays, and signs where
+    /// this machine is when that changes.
     pub(super) async fn background(self) {
         let mut changes = self.store.subscribe();
         let mut addr = self.endpoint.watch_addr();
-        let mut tick = tokio::time::interval(TICK);
         let mut exposed = self.exposed.subscribe();
         let mut mesh_changed = self.mesh.subscribe();
-        let mut expire = tokio::time::interval(KV_EXPIRE_EVERY);
         let mut known: BTreeMap<EndpointId, EndpointAddr> = BTreeMap::new();
         loop {
             let snap = self.store.snapshot();
-            for id in snap.machines.keys() {
-                let Some(info) = snap.machine(id) else { continue };
-                if known.get(id) == Some(&info.addr) {
-                    continue;
-                }
-                self.lookup.set_endpoint_info(info.addr.clone());
-                // A running dial does not see new addresses. Restart the link of a member that is
-                // not up, so it dials the new address at once.
-                if known.insert(*id, info.addr).is_some() && self.peer_status(id).state != PeerState::Up {
-                    self.peers.lock().unwrap().remove(id);
+            let forwarded = self.mesh.ready_urls().into_iter().map(|(id, _)| id);
+            let ids: BTreeSet<EndpointId> = snap.machines.keys().copied().chain(forwarded).collect();
+            for id in ids.into_iter().filter(|id| *id != self.id()) {
+                let addr = self.peer_addr(id);
+                if known.get(&id) != Some(&addr) {
+                    self.lookup.set_endpoint_info(addr.clone());
+                    known.insert(id, addr);
                 }
             }
             self.admission.enforce();
@@ -265,34 +283,13 @@ impl Machine {
             self.apply_cluster_relays(&snap).await;
             if snap.cluster.is_some() {
                 self.publish_self().await;
+                self.bound_unbounded(&snap);
             }
-            // Also with no cluster: after a failed join, this drops the links it started.
-            self.reconcile_links();
             tokio::select! {
                 _ = changes.changed() => {}
-                _ = addr.updated() => {}
+                _ = addr.updated() => tokio::time::sleep(ADDR_SETTLE).await,
                 _ = exposed.changed() => {}
                 _ = mesh_changed.changed() => {}
-                _ = tick.tick() => self.steer_swim(&snap).await,
-                _ = expire.tick() => {
-                    if snap.cluster.is_some()
-                        && let Err(e) = self.kv_expire().await
-                    {
-                        debug!("kv expire: {e:#}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// SWIM finds members on its own, but slowly through a tunnel. Tell it about members whose
-    /// link is up, and that removed members are gone for good.
-    async fn steer_swim(&self, snap: &Snapshot) {
-        for (id, m) in &snap.members {
-            if m.removed && self.store.swim_alive(id) {
-                self.store.forget(id).await;
-            } else if !m.removed && *id != self.id() && self.link_up(id) && !self.store.swim_alive(id) {
-                self.store.announce(id).await;
             }
         }
     }
@@ -309,11 +306,13 @@ impl Machine {
         } else {
             net::relays(&set.relays, &set.token)
         };
-        // The mesh relays come on top: this machine's own relay, and each member's forwarded one.
+        // The mesh relays come on top: this machine's own, and each member's forwarded one. With
+        // all of them in the set, a relay that goes down does not cut the machine off: iroh moves
+        // its home to another one.
         if let Some(h) = self.exposed.borrow().as_ref() {
             want.insert(h.url.clone(), None);
         }
-        for url in self.mesh.ready_urls() {
+        for (_, url) in self.mesh.ready_urls() {
             want.insert(url, None);
         }
         self.set_relays(want).await;
@@ -337,30 +336,78 @@ impl Machine {
         *have = want;
     }
 
+    /// On the owner: removes former owners and admins that left, keeping what they decided until
+    /// now. Until then their stolen keys could sign decisions with an old time.
+    fn bound_unbounded(&self, snap: &Snapshot) {
+        if snap.role(&self.id()) != Some(crate::roster::Role::Owner) || self.role().is_none() {
+            return;
+        }
+        for id in &snap.unbounded {
+            match self.store.remove(self.endpoint.secret_key(), *id, false) {
+                Ok(()) => info!(machine = %id.fmt_short(), "removed a former owner or an admin that left"),
+                Err(e) => warn!(machine = %id.fmt_short(), "cannot remove a former owner or an admin that left: {e:#}"),
+            }
+        }
+    }
+
+    /// Signs where this machine is and what it runs, when that differs from the roster.
     pub(crate) async fn publish_self(&self) {
         let me = self.id();
         let info = self.info();
-        let (member, same) = self.store.read(|s| (s.is_member(&me), s.machine(&me).as_ref() == Some(&info)));
+        // The roster keeps at most MAX_ADDRS addresses, so compare with what it would keep.
+        let info = MachineInfo { addr: Location::new(info.addr).addr, ..info };
+        let (member, same) = self.store.read(|s| {
+            let now = s.machine(&me).map(|m| MachineInfo { name: info.name.clone(), ..m });
+            (s.is_member(&me), now.as_ref() == Some(&info))
+        });
         if !member || same {
             return;
         }
-        let json = serde_json::to_string(&info).expect("machine info is JSON");
-        let r = self
-            .store
-            .write(|c| {
-                c.execute(
-                    "INSERT INTO imesh_machines (id, info) VALUES (?1, ?2) ON CONFLICT (id) DO UPDATE SET info = excluded.info",
-                    rusqlite::params![me.to_string(), json],
-                )
-            })
-            .await;
-        if let Err(e) = r {
+        let mut loc = Location::new(info.addr);
+        loc.version = info.version;
+        loc.os = info.os;
+        loc.arch = info.arch;
+        loc.relay = info.relay;
+        loc.tunnel = info.tunnel;
+        loc.labels = info.labels;
+        if let Err(e) = self.store.sign(self.endpoint.secret_key(), Change::Locate(loc)) {
             warn!("publish self: {e:#}");
         }
     }
 
+    /// Where member `id` is: its location in the roster, and also this machine's own relays and
+    /// the cluster relays. A member whose relay changed signs its new place, but a machine that
+    /// reaches it only through a relay cannot learn that place until they connect. Members that
+    /// share a relay reach each other through it.
+    ///
+    /// A loopback relay in a location names a relay on the machine that signed it. In the
+    /// devtunnel mesh this machine reaches it through its own forward of that member's tunnel.
+    /// Else the URL stays only when this machine uses it too, as with a shared tunnel.
     pub(crate) fn peer_addr(&self, id: EndpointId) -> EndpointAddr {
-        self.store.read(|s| s.machine(&id)).map_or_else(|| id.into(), |i| i.addr)
+        let known = self.store.read(|s| s.machine(&id).map(|i| i.addr));
+        self.reachable(known.unwrap_or_else(|| id.into()))
+    }
+
+    /// `addr`, which another machine published, as this machine can use it. See
+    /// [`Self::peer_addr`].
+    pub(crate) fn reachable(&self, addr: EndpointAddr) -> EndpointAddr {
+        let cluster = self.store.read(|s| s.relays.relays.clone());
+        let shared = |u: &iroh::RelayUrl| {
+            !self.config.net.devtunnel_mesh && (self.initial_relays.contains_key(u) || cluster.contains(u))
+        };
+        let id = addr.id;
+        let addrs: Vec<iroh::TransportAddr> = addr
+            .addrs
+            .into_iter()
+            .filter(|a| !matches!(a, iroh::TransportAddr::Relay(u) if loopback(u) && !shared(u)))
+            .collect();
+        let mine: Vec<iroh::RelayUrl> = self.endpoint.addr().relay_urls().cloned().collect();
+        // Every relay this machine reaches, not only the peer's own: the peer is a client of one of
+        // them, and which one changes when a relay goes down. A URL here names a relay by this
+        // machine's own forward, so it is no use to another machine.
+        let forwarded = self.mesh.ready_urls().into_iter().map(|(_, url)| url);
+        let relays = mine.into_iter().chain(cluster).chain(forwarded).map(iroh::TransportAddr::Relay);
+        EndpointAddr::from_parts(id, addrs.into_iter().chain(relays))
     }
 
     /// Serves one API call. A call for another machine goes one hop over iroh. A member never
@@ -508,9 +555,7 @@ impl Machine {
     /// members in its ticket, and an admission for the machine it admits.
     pub(crate) fn forward_tunnel(&self, id: EndpointId, endpoint: crate::state::TunnelEndpoint) {
         if self.config.net.devtunnel_mesh && id != self.id() {
-            let url = endpoint.relay_url();
             self.mesh.ensure(id, endpoint);
-            self.lookup.set_endpoint_info(self.peer_addr(id).with_relay_url(url));
         }
     }
 
@@ -537,11 +582,17 @@ impl Machine {
     fn reconcile_mesh(&self, snap: &Snapshot) {
         let me = self.id();
         let want: BTreeMap<EndpointId, crate::state::TunnelEndpoint> = snap
-            .members
+            .machines
             .iter()
-            .filter(|(id, m)| !m.removed && **id != me)
-            .filter_map(|(id, _)| Some((*id, snap.machine(id)?.tunnel?)))
+            .filter(|(id, _)| **id != me)
+            .filter_map(|(id, m)| Some((*id, m.tunnel.clone()?)))
             .collect();
         self.mesh.reconcile(&want);
     }
+}
+
+fn loopback(url: &iroh::RelayUrl) -> bool {
+    url.host_str().is_some_and(|h| {
+        h == "localhost" || h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
 }
