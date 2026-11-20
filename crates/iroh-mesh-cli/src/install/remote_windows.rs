@@ -30,6 +30,9 @@ struct Facts {
     service: bool,
 }
 
+/// Reads files with `[IO.File]::ReadAllText`, not `Get-Content`: Windows PowerShell 5.1 adds
+/// properties such as `PSPath` to the text of `Get-Content`, and `ConvertTo-Json` then writes an
+/// object instead of a string.
 const FACTS_PS: &str = r#"$ErrorActionPreference = 'Stop'
 $data = Join-Path $env:LOCALAPPDATA 'imesh'
 $exe = Join-Path $data 'bin\imesh.exe'
@@ -39,9 +42,9 @@ if (Test-Path $exe) {
   $status = (& $exe service status 2>$null | Out-String).Trim()
 }
 $b = Join-Path $data 'bundle\imesh.zip.sha256'
-$bundle = if (Test-Path $b) { (Get-Content -Raw $b).Trim() } else { $null }
+$bundle = if (Test-Path $b) { [IO.File]::ReadAllText($b).Trim() } else { $null }
 $e = Join-Path $data 'env'
-$envText = if (Test-Path $e) { Get-Content -Raw $e } else { $null }
+$envText = if (Test-Path $e) { [IO.File]::ReadAllText($e) } else { $null }
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 [pscustomobject]@{ arch = $arch; data = $data; exeSha = $sha; bundleSha = $bundle; env = $envText; status = $status;
   service = [bool](Get-Service imesh -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress

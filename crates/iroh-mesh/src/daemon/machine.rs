@@ -210,7 +210,12 @@ impl Machine {
         let Some(addr) = r.serve_relay.or(mesh_addr) else { return Ok((None, None)) };
         let gate =
             net::relay::Gate { me: self.id(), token: r.serve_relay_token.clone(), admission: self.admission.clone() };
-        let server = net::relay::serve(r, addr, gate).await?;
+        let server = net::relay::serve(r, addr, gate).await.with_context(|| match r.serve_relay {
+            Some(_) => format!("serve the relay on {addr}"),
+            None => format!(
+                "serve the devtunnel mesh relay on {addr}: the port may be in use or reserved; set another mesh port"
+            ),
+        })?;
         if let Some(service) = server.relay_service() {
             self.admission.set_relay_clients(service.clients().clone());
         }
