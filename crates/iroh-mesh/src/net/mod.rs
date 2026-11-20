@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result};
 use iroh::RelayUrl;
 
-pub use devtunnel::{Connect as DevTunnel, Expose, delete_own as delete_devtunnel, mesh_port};
+pub use devtunnel::{Connect as DevTunnel, Expose, delete_own as delete_devtunnel};
 
 /// How a machine connects: its relays, address lookup, and the relay it serves. The default
 /// uses no n0 relays and no n0 address lookup: set `n0` or `relays` to reach machines behind NAT.
@@ -31,11 +31,8 @@ pub struct Config {
     pub n0: bool,
     /// Where the iroh endpoint listens for UDP. `None`: every interface, a random port.
     pub bind: Option<SocketAddr>,
-    /// The first loopback port for Corrosion's gossip. Each member has two ports from here, from
-    /// its key. Every member of a cluster must use the same value. `None`: 20000.
-    pub gossip_port_base: Option<u16>,
     /// The loopback port of this machine's relay in the devtunnel mesh. Members read it from this
-    /// machine's record. `None`: a port from the key, 49152 to 65534.
+    /// machine's location in the roster. `None`: a port from the key, 49152 to 65534.
     pub mesh_port: Option<u16>,
     /// Also publish and resolve addresses through this pkarr server (a self-hosted
     /// iroh-dns-server), for example `https://dns.example.com/pkarr`.

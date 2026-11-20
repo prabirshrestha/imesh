@@ -67,38 +67,38 @@ A=ops@localhost:${PB}01 B=ops@localhost:${PB}02 C=ops@localhost:${PB}03
 # One SSH context per machine: `ON $A <command>` runs the command on that machine's daemon.
 ctx_of() { case "$1" in "$A") echo a ;; "$B") echo b ;; "$C") echo c ;; *) echo "$1" ;; esac; }
 ON() { $I -c "$(ctx_of "$1")" "${@:2}"; }
-id_of() { ON "$1" dev call machine.inspect | awk -F'"' '/"id"/{print $4; exit}'; }
+id_of() { ON "$1" dev call machine.inspect | awk -F'"' '/"id"/ && !n++ {print $4}'; }
 tunnel_of() { docker exec "$P-$1" sh -c 'for d in /dt/t/*/; do [ "$(cat $d/host 2>/dev/null)" = '"$1"' ] && basename $d; done; true'; }
-# put <machine> <key> <value>, then get it on each machine in turn
-put() { ON "$1" kv set "$2" "$3" >/dev/null; }
-synced() { # <machine> <key> <value> [seconds]
-	for _ in $(seq 1 "${4:-60}"); do
-		[ "$(ON "$1" kv get "$2" 2>/dev/null)" = "$3" ] && return 0
+# reaches <machine> <name> [seconds]: the machine's status probe gets an answer from member <name>.
+reaches() {
+	for _ in $(seq 1 "${3:-60}"); do
+		[ "$(ON "$1" status 2>/dev/null | awk -v n="$2" '$1==n{print $4}')" = up ] && return 0
 		sleep 1
 	done
 	return 1
 }
 logs() { for n in $NODES; do echo "--- $n"; docker exec "$P-$n" sh -c 'tail -n 15 /home/ops/.local/share/imesh/*.log 2>/dev/null | sed "s/\x1b\[[0-9;]*m//g" | cut -c1-300' || true; done; }
 
-echo "== 1. A founds the cluster; B and C join; all use --relay devtunnel"
-# add over SSH: the invite flow needs the real service to host a pairing tunnel.
-$I add "$A" --new --name a --relay devtunnel >/dev/null
-$I add "$B" --name b --relay devtunnel >/dev/null
-$I add "$C" --name c --relay devtunnel >/dev/null
+echo "== 1. A founds the cluster; B and C join; all use --relay devtunnel on one mesh port"
+# add over SSH: the invite flow needs the real service to host a pairing tunnel. With one port,
+# each machine's own relay holds it, so every forward listens on another local port.
+$I add "$A" --new --name a --relay devtunnel --mesh-port 3400 >/dev/null
+$I add "$B" --name b --relay devtunnel --mesh-port 3400 >/dev/null
+$I add "$C" --name c --relay devtunnel --mesh-port 3400 >/dev/null
 for n in a b c; do
 	case $n in a) h=$A ;; b) h=$B ;; c) h=$C ;; esac
 	$I ctx add "$n" "$h" >/dev/null
 done
 $I ctx use default >/dev/null
 for _ in $(seq 1 90); do
-	up=$($I status | awk 'NR>1 && $3=="up"' | wc -l | tr -d ' ')
+	up=$($I status | awk 'NR>1 && $4=="up"' | wc -l | tr -d ' ')
 	[ "$up" = 3 ] && break
 	sleep 1
 done
 $I status
 [ "$up" = 3 ] || { logs; fail "not all 3 up"; }
-$I status | awk 'NR>1 && $4=="direct"' | grep -q . && fail "a direct path exists"
-pass "a, b, c are up, through relays"
+$I status | awk 'NR>1 && $5=="direct"' | grep -q . && fail "a direct path exists"
+pass "a, b, c are up, through relays, with one mesh port"
 
 echo "== 2. each machine hosts one tunnel with a readable name and forwards each peer"
 for n in $NODES; do
@@ -120,20 +120,21 @@ done
 docker exec "$P-a" grep -qx "b connect $T_c" /dt/log || { docker exec "$P-a" cat /dt/log; fail "b did not connect to c's tunnel"; }
 pass "tunnels $T_a $T_b $T_c; 2 forwards each; b connected to $T_c"
 
-echo "== 3. writes pass between b and c"
-put "$B" b2c 1; synced "$C" b2c 1 || fail "b to c"
-put "$C" c2b 1; synced "$B" c2b 1 || fail "c to b"
+echo "== 3. b and c reach each other"
+reaches "$B" c || fail "b to c"
+reaches "$C" b || fail "c to b"
 pass "b to c and c to b"
 
-echo "== 4. a stops; b and c still pass writes; a catches up when it comes back"
+echo "== 4. a stops; b and c still reach each other; a reaches both when it comes back"
 docker stop "$P-a" >/dev/null
-put "$B" b2c-down 1; synced "$C" b2c-down 1 || { logs; fail "b to c with a down"; }
-put "$C" c2b-down 1; synced "$B" c2b-down 1 || { logs; fail "c to b with a down"; }
-pass "b and c pass writes with a stopped"
+reaches "$B" c || { logs; fail "b to c with a down"; }
+reaches "$C" b || { logs; fail "c to b with a down"; }
+[ "$(ON "$B" status | awk '$1=="a"{print $4}')" = down ] || fail "b does not report a down"
+pass "b and c reach each other with a stopped, and report a down"
 docker start "$P-a" >/dev/null
 t0=$(date +%s)
-synced "$A" b2c-down 1 180 && synced "$A" c2b-down 1 30 || { logs; fail "a did not get the writes made while it was down"; }
-pass "a caught up $(($(date +%s) - t0))s after it started"
+reaches "$A" b 180 && reaches "$A" c 30 || { logs; fail "a does not reach b and c after it started"; }
+pass "a reaches b and c $(($(date +%s) - t0))s after it started"
 
 echo "== 5. a stuck forward is stopped and started again by the daemon"
 fwd=$(docker exec "$P-b" cat "/tmp/fake-devtunnel/forwarder-$T_c")
@@ -148,8 +149,8 @@ for _ in $(seq 1 150); do
 done
 [ "$conn2" != "$conn" ] || { logs; fail "b did not restart its stuck forward to c within 150s"; }
 docker exec "$P-b" kill -0 "$conn" 2>/dev/null && fail "the stuck connect still runs"
-put "$B" after-stuck 1; synced "$C" after-stuck 1 || fail "b to c after the restart"
-pass "b stopped and restarted its stuck forward to c after $(($(date +%s) - t0))s; writes pass"
+reaches "$B" c || fail "b to c after the restart"
+pass "b stopped and restarted its stuck forward to c after $(($(date +%s) - t0))s; b reaches c"
 
 echo "== 6. a stuck tunnel host is stopped and started again"
 host=$(docker exec "$P-c" cat /tmp/fake-devtunnel/hosting)
@@ -161,22 +162,34 @@ for _ in $(seq 1 150); do
 	sleep 1
 done
 [ "$host2" != "$host" ] || { logs; fail "c did not restart its stuck host within 150s"; }
-put "$B" after-host 1; synced "$C" after-host 1 || fail "b to c after the host restart"
-pass "c stopped and restarted its stuck host after $(($(date +%s) - t0))s; writes pass"
+reaches "$B" c || fail "b to c after the host restart"
+pass "c stopped and restarted its stuck host after $(($(date +%s) - t0))s; b reaches c"
 
-echo "== 7. a leaves with logout; its tunnel is deleted"
-docker exec -u ops -w /home/ops "$P-a" /home/ops/.local/share/imesh/bin/imesh logout
-docker exec "$P-a" test ! -d "/dt/t/$T_a" || fail "a's tunnel $T_a is still in the map"
-for m in "$B" "$C"; do
-	for _ in $(seq 1 30); do ON "$m" status | awk 'NR>1{print $1}' | grep -qx a || break; sleep 1; done
-	ON "$m" status | awk 'NR>1{print $1}' | grep -qx a && fail "$m still lists a"
+echo "== 7. c leaves with logout; its tunnel is deleted"
+# The owner cannot leave, so a plain member does.
+docker exec -u ops -w /home/ops "$P-c" /home/ops/.local/share/imesh/bin/imesh logout
+docker exec "$P-a" test ! -d "/dt/t/$T_c" || fail "c's tunnel $T_c is still in the map"
+for m in "$A" "$B"; do
+	for _ in $(seq 1 30); do ON "$m" status | awk 'NR>1{print $1}' | grep -qx c || break; sleep 1; done
+	ON "$m" status | awk 'NR>1{print $1}' | grep -qx c && fail "$m still lists c"
 done
-put "$B" after-leave 1; synced "$C" after-leave 1 || fail "b to c after a left"
-put "$C" after-leave2 1; synced "$B" after-leave2 1 || fail "c to b after a left"
-for n in b c; do
+reaches "$A" b || fail "a to b after c left"
+reaches "$B" a || fail "b to a after c left"
+for n in a b; do
 	f=$(docker exec "$P-$n" sh -c 'pgrep -u ops -f "^/bin/sh /usr/bin/devtunnel connect" | wc -l')
-	[ "$f" = 1 ] || fail "$n runs $f forwards after a left, not 1"
+	[ "$f" = 1 ] || fail "$n runs $f forwards after c left, not 1"
 done
-pass "a's tunnel is gone; b and c do not list a, run 1 forward each, and pass writes"
+pass "c's tunnel is gone; a and b do not list c, run 1 forward each, and reach each other"
+
+echo "== 8. b moves its relay to another mesh port; its tunnel follows and a reaches b"
+$I update server "$B" --mesh-port 3500 >/dev/null
+for _ in $(seq 1 60); do
+	[ "$(docker exec "$P-a" cat "/dt/t/$T_b/port" 2>/dev/null)" = 3500 ] && break
+	sleep 1
+done
+[ "$(docker exec "$P-a" cat "/dt/t/$T_b/port" 2>/dev/null)" = 3500 ] || { logs; fail "b's tunnel does not have port 3500"; }
+reaches "$A" b 120 || { logs; fail "a to b after b moved its port"; }
+reaches "$B" a || fail "b to a after b moved its port"
+pass "b's tunnel has port 3500; a and b reach each other"
 
 echo "ALL PASS"

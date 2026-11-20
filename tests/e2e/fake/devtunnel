@@ -74,9 +74,12 @@ show)
 	labels=$(sed 's/.*/"&"/' "$dir/labels" | paste -sd, -)
 	printf '{"tunnel":{"tunnelId":"%s","hostConnections":%s,"labels":[%s],"ports":[%s]}}' "$2" "$hosts" "$labels" "$ports" ;;
 port)
-	# port create <tunnel> -p <port> --protocol http
+	# port create <tunnel> -p <port> --protocol http, or port delete <tunnel> -p <port>
 	need "$3"
-	echo "$5" >"$(t "$3")/port" ;;
+	case $2 in
+	create) echo "$5" >"$(t "$3")/port" ;;
+	delete) if [ "$(cat "$(t "$3")/port" 2>/dev/null)" = "$5" ]; then rm -f "$(t "$3")/port"; fi ;;
+	esac ;;
 host)
 	need "$2"
 	dir=$(t "$2")
@@ -95,11 +98,18 @@ connect)
 	echo $$ >"$S/connecting-$2"
 	echo "$(hostname) connect $2" >>"$D/log"
 	echo "Connected to tunnel: $2"
-	echo "SSH: PortForwardingService listening on 127.0.0.1:$port."
 	# The forwarder is a child, so killing it (pid in "forwarder") leaves a connect that runs
-	# but no longer forwards, as a real one can. It dies with this process.
-	setpriv --pdeathsig KILL socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "TCP:$(cat "$dir/addr")" &
-	echo $! >"$S/forwarder-$2"
+	# but no longer forwards, as a real one can. It dies with this process. Like the real CLI,
+	# it takes the next port when the tunnel's port is in use.
+	while :; do
+		setpriv --pdeathsig KILL socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "TCP:$(cat "$dir/addr")" 2>/dev/null &
+		fwd=$!
+		sleep 0.5
+		kill -0 "$fwd" 2>/dev/null && break
+		port=$((port + 1))
+	done
+	echo $fwd >"$S/forwarder-$2"
+	echo "SSH: PortForwardingService listening on 127.0.0.1:$port."
 	while :; do sleep 3600; done ;;
 delete)
 	need "$2"

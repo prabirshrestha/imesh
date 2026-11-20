@@ -10,12 +10,11 @@ const WINDOWS: &str = "x86_64-pc-windows-gnu";
 const HELP: &str = "\
 cargo x <task>
 
-  tools            install build tools, prepare the checkout, and check prerequisites
+  tools            install build tools and check prerequisites
   install          build every target, make the npm packages, and install them with
                    `npm install -g`, so `imesh` is on PATH. Starts no daemon
-  setup            once after clone: check out Corrosion and apply vendor/corrosion.patch
   test             unit tests of both crates
-  lint             rustfmt check, and clippy with warnings as errors
+  lint             license copies, rustfmt check, and clippy with warnings as errors
   build [--target <triple>]... [--example app]
                    a bundle in dist/: every target (or the given ones), a manifest, and imesh.zip
   windows          clippy for Windows, and the Windows build of the imesh command and the example app
@@ -33,11 +32,11 @@ fn main() -> ExitCode {
     let task = args.first().map(String::as_str).unwrap_or("help");
     let rest = args.get(1..).unwrap_or_default();
     let result = match task {
-        "setup" => setup(&root),
         "tools" => install_prerequisites(&root),
         "install" => build(&root, &[]).and_then(|()| npm_install(&root)),
         "test" => cargo(&root, &["test", "--workspace"]),
-        "lint" => cargo(&root, &["fmt", "--all", "--check"])
+        "lint" => licenses(&root)
+            .and_then(|()| cargo(&root, &["fmt", "--all", "--check"]))
             .and_then(|()| cargo(&root, &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])),
         "windows" => windows_cargo(
             &root,
@@ -64,6 +63,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Each crate ships its own copy of the license files, so cargo packages them. Fails when a copy
+/// differs from the file at the root.
+fn licenses(root: &Path) -> Result<(), String> {
+    let files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/codync-network-APACHE-2.0.txt"];
+    for krate in ["iroh-mesh", "iroh-mesh-cli"] {
+        for file in files {
+            let (a, b) = (root.join(file), root.join("crates").join(krate).join(file));
+            let same = matches!((std::fs::read(&a), std::fs::read(&b)), (Ok(x), Ok(y)) if x == y);
+            if !same {
+                return Err(format!("{} differs from {}; copy the root file", b.display(), a.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run(cmd: &mut Command) -> Result<(), String> {
@@ -93,35 +108,6 @@ fn script(root: &Path, path: &str, vars: &[String]) -> Result<(), String> {
         cmd.env(k, val);
     }
     run(&mut cmd)
-}
-
-/// Checks out Corrosion at the pinned commit and applies imesh's patch. Safe to run twice.
-fn setup(root: &Path) -> Result<(), String> {
-    run(Command::new("git").current_dir(root).args(["submodule", "update", "--init", "vendor/corrosion"]))?;
-    let corrosion = root.join("vendor/corrosion");
-    let patch = std::fs::read_to_string(root.join("vendor/corrosion.patch")).map_err(|e| e.to_string())?;
-    for part in patch.split("diff --git ").filter(|p| !p.trim().is_empty()) {
-        let patch = format!("diff --git {part}");
-        let check = |reverse: bool| -> Result<bool, String> {
-            use std::io::Write;
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&corrosion).args(["apply", "--check"]);
-            if reverse { cmd.arg("--reverse"); }
-            let mut child = cmd.stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
-                .spawn().map_err(|e| e.to_string())?;
-            child.stdin.take().expect("piped").write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
-            child.wait().map(|s| s.success()).map_err(|e| e.to_string())
-        };
-        if check(true)? { continue; }
-        if !check(false)? { return Err(format!("vendor patch conflicts with local edits: {}", part.lines().next().unwrap_or_default())); }
-        use std::io::Write;
-        let mut child = Command::new("git").current_dir(&corrosion).arg("apply")
-            .stdin(std::process::Stdio::piped()).spawn().map_err(|e| e.to_string())?;
-        child.stdin.take().expect("piped").write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
-        if !child.wait().map_err(|e| e.to_string())?.success() { return Err("apply vendor patch failed".into()); }
-    }
-    println!("Corrosion patches are applied");
-    Ok(())
 }
 
 /// The targets of a full bundle. The host's own triple is added when it is not one of them.
@@ -322,26 +308,24 @@ fn zig_linker(root: &Path, triple: &str) -> Result<PathBuf, String> {
 }
 
 fn install_prerequisites(root: &Path) -> Result<(), String> {
-    setup(root)?;
     let mut targets = vec!["target", "add"];
     targets.extend(TARGETS.iter().copied());
     run(Command::new("rustup").args(targets))?;
-    run(Command::new("rustup").args(["toolchain", "install", "nightly-2023-10-05", "--profile", "minimal"]))?;
     if !has("cargo-zigbuild", "--version") {
         cargo(root, &["install", "cargo-zigbuild", "--locked"])?;
     }
     let host = host_triple()?;
     if host.contains("apple-darwin") {
         if !has("brew", "--version") { return Err("install Homebrew from https://brew.sh, then run cargo x tools".into()); }
-        run(Command::new("brew").args(["install", "zig", "mingw-w64", "llvm@20"]))?;
+        run(Command::new("brew").args(["install", "zig", "mingw-w64"]))?;
     } else if host.contains("linux") {
-        return Err("install Zig, MinGW-w64, LLVM 20 (libclang and llvm-objcopy), and an Apple SDK/build host; Rust tools and checkout are ready".into());
+        return Err("install Zig, MinGW-w64, and an Apple SDK/build host; Rust tools are ready".into());
     } else {
-        return Err("full bundles need a macOS build host with an Apple SDK; Rust tools and checkout are ready".into());
+        return Err("full bundles need a macOS build host with an Apple SDK; Rust tools are ready".into());
     }
     for (cmd, arg) in [("zig", "version"), ("cargo-zigbuild", "--version"), ("x86_64-w64-mingw32-gcc", "--version")] {
         if !has(cmd, arg) { return Err(format!("required tool is missing: {cmd}")); }
     }
-    println!("Build tools and checkout are ready. Run cargo x build.");
+    println!("Build tools are ready. Run cargo x build.");
     Ok(())
 }

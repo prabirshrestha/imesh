@@ -248,9 +248,9 @@ async fn facts(ssh: &Ssh) -> Result<Facts> {
 #[derive(Debug, Deserialize)]
 pub(super) struct Status {
     pub(super) cluster: Option<String>,
-    /// Alone in its own cluster, with no `kv` rows and no app rows.
+    /// The only member of its own cluster: leaving it loses nothing.
     #[serde(default)]
-    pub(super) alone_and_empty: bool,
+    pub(super) alone: bool,
 }
 
 impl Status {
@@ -260,10 +260,9 @@ impl Status {
             Some(c) if mode == Mode::NewCluster => {
                 bail!("{} is already in cluster {c}; run `imesh logout` there first", target.display())
             }
-            Some(c) if !self.alone_and_empty => bail!(
-                "{} is in cluster {c} with other members or data; run `imesh logout` there first",
-                target.display()
-            ),
+            Some(c) if !self.alone => {
+                bail!("{} is in cluster {c} with other members; run `imesh logout` there first", target.display())
+            }
             _ => Ok(()),
         }
     }

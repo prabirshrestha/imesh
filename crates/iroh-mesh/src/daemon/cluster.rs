@@ -1,92 +1,96 @@
 //! Cluster operations on a machine: start a cluster, admit and join machines, remove them, and
-//! manage relays. The API methods in `methods.rs` call these; an app that embeds a
+//! manage roles and relays. The API methods in `methods.rs` call these; an app that embeds a
 //! machine can call them directly.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use iroh::EndpointId;
-use rusqlite::params;
 
-use super::Machine;
+use super::{Caller, Machine};
 use crate::{
-    api::{JoinTicket, Joined, MachineRow},
+    api::{Initialized, JoinTicket, Joined, MachineRow},
     net,
-    state::{RelaySettings, schema},
+    roster::{Change, Relays, Role, Roster, recovery_code, root_from_code},
+    state::RelaySettings,
 };
 
-/// How long a join waits for a member to send this machine its own member row.
-const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Where to run a decision, for error text, on a machine that the members refuse as removed.
+const REMOVED: &str = "another machine: the members refuse this one as removed";
+
 /// How long `machine.reset` waits at most for its reply to reach the caller.
-/// A member name: letters, digits, '-', '_', and '.', and never `self`, which the CLI uses for
-/// this computer's machine.
+pub(super) const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A member name: letters, digits, '-', and '_', and never `self`, which the CLI uses for this
+/// computer's machine.
 pub fn valid_name(name: &str) -> Result<()> {
     ensure!(
-        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
-        "a name has letters, digits, '-', '_', and '.' only"
+        crate::roster::valid_name(name),
+        "a name has 1 to {} letters, digits, '-', and '_'",
+        crate::roster::MAX_NAME
     );
     ensure!(!name.eq_ignore_ascii_case("self"), "`self` is reserved for this computer's machine; pick another name");
     Ok(())
 }
 
-/// How long an expired key stays before cleanup deletes it. Reads stop showing a key when it
-/// expires; the delete waits much longer, so a machine whose clock is ahead of the writer's by
-/// less than this never deletes a key that the writer still counts as live.
-pub(crate) const KV_EXPIRE_GRACE: Duration = Duration::from_secs(3600);
-
-/// Seconds since the Unix epoch, by this machine's clock.
-pub(crate) fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+/// Fails when `caller` may not have this machine sign `what`. A remote member acts through this
+/// machine only where its own role, as `may` judges it, lets it act. Else a plain member could
+/// make the owner's machine sign what the member may not sign. Run it in [`crate::state::Store::sign_if`],
+/// so the role cannot change before the signature.
+fn caller_may(r: &Roster, caller: Caller, may: impl FnOnce(Option<Role>) -> bool, what: &str) -> Result<()> {
+    if let Caller::Member(id) = caller {
+        let role = r.role(&id);
+        ensure!(may(role), "a {} cannot {what} through another machine", role_name(role));
+    }
+    Ok(())
 }
 
-pub(super) const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+fn role_name(role: Option<Role>) -> &'static str {
+    match role {
+        Some(Role::Owner) => "owner",
+        Some(Role::Admin) => "admin",
+        Some(Role::Member) => "plain member",
+        None => "machine outside the cluster",
+    }
+}
 
-/// Inserts a row or replaces its `value_col`. Table and column names are constants of this module.
-fn upsert(
-    c: &rusqlite::Connection,
-    table: &str,
-    key_col: &str,
-    value_col: &str,
-    key: &str,
-    value: &str,
-) -> rusqlite::Result<usize> {
-    c.execute(
-        &format!(
-            "INSERT INTO {table} ({key_col}, {value_col}) VALUES (?1, ?2) \
-             ON CONFLICT ({key_col}) DO UPDATE SET {value_col} = excluded.{value_col}"
-        ),
-        params![key, value],
-    )
+fn decides(role: Option<Role>) -> bool {
+    matches!(role, Some(Role::Owner | Role::Admin))
 }
 
 impl Machine {
-    /// The ID of the cluster this machine is in.
+    /// The ID of the cluster this machine is in: the root public key, as text.
     pub fn cluster(&self) -> Option<String> {
         self.store.read(|s| s.cluster.as_ref().map(|c| c.id.clone()))
     }
 
-    /// Starts a new cluster with this machine as its only member. `name` is this machine's name
-    /// in the cluster; the default is [`Machine::name`]. Returns the cluster ID.
-    pub async fn init_cluster(&self, name: Option<String>) -> Result<String> {
-        ensure!(self.cluster().is_none(), "machine is already in a cluster");
-        let id = hex::encode(rand::random::<[u8; 16]>());
-        let (me, name) = (self.id().to_string(), name.unwrap_or_else(|| self.name.clone()));
-        valid_name(&name)?;
-        self.store
-            .write(|c| {
-                c.execute("INSERT INTO imesh_cluster (id, founder) VALUES (?1, ?2)", params![id, me])?;
-                c.execute("INSERT INTO imesh_members (id, name) VALUES (?1, ?2)", params![me, name])
-            })
-            .await?;
-        self.online().await;
-        self.publish_self().await;
-        Ok(id)
+    /// This machine's role in its cluster. None while the members refuse it as removed: the
+    /// members do not send their roster to a removed machine, so its own copy may still give it
+    /// the role it had, and nothing it signs then counts.
+    pub fn role(&self) -> Option<Role> {
+        if self.cut_off.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.store.read(|s| s.role(&self.id()))
     }
 
-    /// Admits the machine with key `id` under `name`, and returns the ticket it joins with. The
-    /// members accept its key from now on.
+    /// Starts a new cluster with this machine as its owner. `name` is this machine's name in the
+    /// cluster; the default is [`Machine::name`]. Returns the cluster ID and the recovery code,
+    /// which no machine keeps: show it once.
+    pub async fn init_cluster(&self, name: Option<String>) -> Result<Initialized> {
+        let name = name.unwrap_or_else(|| self.name.clone());
+        valid_name(&name)?;
+        let root = self.store.create(self.endpoint.secret_key(), name)?;
+        self.online().await;
+        self.publish_self().await;
+        Ok(Initialized { cluster: root.public().to_string(), recovery_code: recovery_code(&root) })
+    }
+
+    /// Admits the machine with key `id` under `name`, for `caller`, and returns the ticket it
+    /// joins with. Only the owner and admins may admit.
     pub async fn admit(
         &self,
+        caller: Caller,
         id: EndpointId,
         name: &str,
         tunnel: Option<crate::state::TunnelEndpoint>,
@@ -94,66 +98,63 @@ impl Machine {
         valid_name(name)?;
         let snap = self.store.snapshot();
         let cluster = snap.cluster.clone().context("machine is not in a cluster")?;
+        let add = "add a machine";
+        caller_may(&self.store.roster().context("machine is not in a cluster")?, caller, decides, add)?;
         ensure!(!snap.is_removed(&id), "machine {} was removed; reset it to get a new identity", id.fmt_short());
         ensure!(
-            !snap.members.iter().any(|(other, m)| !m.removed && m.name == name && *other != id),
+            !snap.members.iter().any(|(other, m)| m.name.eq_ignore_ascii_case(name) && *other != id),
             "name {name:?} is taken"
         );
-        // Every member reaches each other one at fixed loopback ports, so ports must not collide.
-        let base = self.store.gossip_base;
-        let tunnels = self.member_tunnels(&snap);
-        for other in self.members().into_iter().filter(|m| *m != id) {
-            ensure!(
-                crate::state::slot(base, &other) != crate::state::slot(base, &id),
-                "machine {} has the gossip ports of member {}; reset it for a new key with `imesh call machine.reset`",
-                id.fmt_short(),
-                other.fmt_short()
-            );
-        }
+        ensure!(
+            matches!(self.role(), Some(Role::Owner | Role::Admin)),
+            "only the owner and admins can add machines; run this on {}",
+            self.deciders(&snap)
+        );
         if let Some(t) = &tunnel {
-            let mine = self.tunnel_endpoint();
-            for (other, e) in tunnels.iter().map(|(i, e)| (*i, e)).chain(mine.as_ref().map(|e| (self.id(), e))) {
-                ensure!(
-                    other == id || e.port() != t.port(),
-                    "machine {} uses mesh port {}, as member {} does; start it with another --mesh-port",
-                    id.fmt_short(),
-                    t.port(),
-                    other.fmt_short()
-                );
-            }
             tracing::info!(machine = %id.fmt_short(), ?t, "admitting a mesh machine; forwarding its relay");
             self.forward_tunnel(id, t.clone());
         } else {
             tracing::info!(machine = %id.fmt_short(), "admitting a machine with no mesh tunnel");
         }
-        let key = id.to_string();
-        self.store.write(|c| upsert(c, "imesh_members", "id", "name", &key, name)).await?;
+        if !snap.is_member(&id) {
+            let admit = Change::Admit { id, name: name.to_string() };
+            self.store.sign_if(self.endpoint.secret_key(), |r| caller_may(r, caller, decides, add), |_| admit)?;
+        }
         self.online().await;
         let others = self.members().into_iter().filter(|m| *m != self.id() && *m != id);
         let peers = std::iter::once(self.endpoint.addr()).chain(others.map(|m| self.peer_addr(m))).collect();
-        let mut tunnels: Vec<_> = tunnels.into_iter().filter(|(m, _)| *m != id).collect();
+        let mut tunnels: Vec<_> = self.member_tunnels(&snap).into_iter().filter(|(m, _)| *m != id).collect();
         tunnels.extend(self.tunnel_endpoint().map(|e| (self.id(), e)));
-        Ok(JoinTicket { cluster: cluster.id, peers, relays: snap.relay_settings(), gossip_port_base: base, tunnels })
+        let roster = self.store.roster().context("machine is not in a cluster")?;
+        Ok(JoinTicket { cluster: cluster.id, peers, relays: snap.relay_settings(), tunnels, roster })
     }
 
-    /// The mesh tunnel of each other member, from its row.
+    /// The names of the machines that may add and remove machines, for error text.
+    fn deciders(&self, snap: &crate::state::Snapshot) -> String {
+        if self.cut_off.load(std::sync::atomic::Ordering::Relaxed) {
+            return REMOVED.into();
+        }
+        let names: Vec<&str> = snap
+            .members
+            .values()
+            .filter(|m| matches!(m.role, Role::Owner | Role::Admin))
+            .map(|m| m.name.as_str())
+            .collect();
+        if names.is_empty() { "the owner".into() } else { names.join(" or ") }
+    }
+
+    /// The mesh tunnel of each other member, from the roster.
     fn member_tunnels(&self, snap: &crate::state::Snapshot) -> Vec<(EndpointId, crate::state::TunnelEndpoint)> {
         let me = self.id();
-        self.members().into_iter().filter(|m| *m != me).filter_map(|m| Some((m, snap.machine(&m)?.tunnel?))).collect()
+        snap.machines.iter().filter(|(id, _)| **id != me).filter_map(|(id, m)| Some((*id, m.tunnel.clone()?))).collect()
     }
 
-    /// Joins the cluster of `ticket`: links to its members, and waits until Corrosion has brought
-    /// this machine its own member row. A machine that holds rows of the same cluster from a
-    /// failed join may try again; rows of another cluster need a reset first.
+    /// Joins the cluster of `ticket`: takes the ticket's roster, which already admits this
+    /// machine, and tells the members where this machine is.
     pub async fn join(&self, ticket: &JoinTicket) -> Result<Joined> {
         let me = self.id();
-        ensure!(
-            ticket.gossip_port_base == self.store.gossip_base,
-            "the cluster uses gossip ports from {}, and this machine from {}; start it with --gossip-port-base {}",
-            ticket.gossip_port_base,
-            self.store.gossip_base,
-            ticket.gossip_port_base
-        );
+        let network: EndpointId = ticket.cluster.parse().context("bad cluster id in the ticket")?;
+        ensure!(ticket.roster.network == network, "the ticket's roster is for another cluster");
         if let Some(c) = self.cluster() {
             ensure!(c == ticket.cluster, "machine holds cluster {c}; reset it to join another");
             ensure!(!self.members().contains(&me), "machine is already in cluster {c}");
@@ -163,52 +164,100 @@ impl Machine {
         *self.joining.lock().unwrap() = net::relays(&ticket.relays.relays, &ticket.relays.token);
         self.apply_cluster_relays(&self.store.snapshot()).await;
         self.online().await;
-        self.admission.set_bootstrap(ticket.peers.iter().map(|a| a.id).collect());
         for addr in &ticket.peers {
-            self.lookup.set_endpoint_info(addr.clone());
+            self.lookup.set_endpoint_info(self.reachable(addr.clone()));
         }
-        // A mesh member has no rows yet: forward the members' tunnels from the ticket first.
         for (id, e) in &ticket.tunnels {
             self.forward_tunnel(*id, e.clone());
         }
         if self.config.net.devtunnel_mesh && !ticket.tunnels.is_empty() {
             self.wait_mesh_ready(&ticket.tunnels).await;
         }
-        self.reconcile_links();
-        let deadline = Instant::now() + JOIN_TIMEOUT;
-        let mut changes = self.store.subscribe();
-        let joined = loop {
-            if self.store.read(|s| s.cluster.is_some() && s.is_member(&me)) {
-                break true;
-            }
-            if Instant::now() > deadline {
-                break false;
-            }
-            for addr in &ticket.peers {
-                self.store.announce(&addr.id).await;
-            }
-            let _ = tokio::time::timeout(Duration::from_secs(2), changes.changed()).await;
-        };
-        self.admission.set_bootstrap(Default::default());
+        self.store.merge(ticket.roster.clone(), Some(network)).await?;
         self.joining.lock().unwrap().clear();
         self.mesh.unpin();
         let snap = self.store.snapshot();
         self.apply_cluster_relays(&snap).await;
-        self.reconcile_links();
-        ensure!(joined, "no member sent this machine its member row within {JOIN_TIMEOUT:?}");
-        let c = snap.cluster.context("no cluster row after sync")?;
-        ensure!(c.id == ticket.cluster, "members are in cluster {}, expected {}", c.id, ticket.cluster);
+        ensure!(snap.is_member(&me), "the ticket's roster does not admit this machine; ask for a new invite");
         self.publish_self().await;
-        Ok(Joined { cluster: c.id, members: self.members().len() })
+        Ok(Joined { cluster: ticket.cluster.clone(), members: self.members().len() })
     }
 
-    /// Renames member `id` in the cluster. Every member sees the new name. Names are unique.
-    pub async fn rename_member(&self, id: EndpointId, name: &str) -> Result<()> {
+    /// Removes a member for good. It must reset and join with a new key to come back. Its open
+    /// connections close. With `cascade`, every admission, promotion, and removal it made is void
+    /// too, for a machine that was stolen. Only the owner and admins may remove others; admins
+    /// remove plain members only.
+    pub async fn remove_member(&self, caller: Caller, id: EndpointId, cascade: bool) -> Result<()> {
+        ensure!(id != self.id(), "a machine does not remove itself; run `imesh rm` on another machine, or leave");
+        let snap = self.store.snapshot();
+        ensure!(snap.is_member(&id), "not a member");
+        let mine = self.role();
+        let theirs = snap.role(&id);
+        ensure!(
+            mine == Some(Role::Owner) || (mine == Some(Role::Admin) && theirs == Some(Role::Member)),
+            "only the owner can remove an admin, and only the owner and admins can remove members; run this on {}",
+            self.deciders(&snap)
+        );
+        let allowed = |r: &Roster| {
+            let theirs = r.role(&id);
+            let may = |mine| mine == Some(Role::Owner) || (mine == Some(Role::Admin) && theirs == Some(Role::Member));
+            caller_may(r, caller, may, "remove this machine")
+        };
+        self.store.sign_if(self.endpoint.secret_key(), allowed, |r| r.removal(id, cascade))?;
+        self.hello_all().await;
+        Ok(())
+    }
+
+    /// Leaves the cluster for good, before this machine's data is deleted: signs its own removal
+    /// and hands the roster to a member that answers, so the removal reaches the others after
+    /// this machine is gone. Returns that member and the devtunnel this machine hosts, for the
+    /// caller to delete after the daemon stops. Fails if no other member answers.
+    pub async fn leave(&self) -> Result<(EndpointId, Option<String>)> {
+        ensure!(self.cluster().is_some(), "machine is not in a cluster");
+        let me = self.id();
+        let others: Vec<EndpointId> = self.members().into_iter().filter(|id| *id != me).collect();
+        ensure!(!others.is_empty(), "this machine is the only member; there is no cluster to tell");
+        ensure!(self.role() != Some(Role::Owner), "the owner cannot leave; move the owner with `imesh recover` first");
+        // The removal keeps what this machine decided: the machines it admitted stay, and the
+        // machines it removed stay out. A machine that is out already, as after a leave that no
+        // member answered, only hands its removal on.
+        if !self.store.read(|s| s.is_removed(&me)) {
+            self.store.remove(self.endpoint.secret_key(), me, false)?;
+        }
+        let mut errors = Vec::new();
+        for id in others {
+            let status = self.fresh_hello(id).await;
+            // A member that refused this machine as removed has the removal already.
+            if status.error.is_none() || status.refused_as_removed {
+                return Ok((id, self.exposed.borrow().as_ref().map(|h| h.tunnel.clone())));
+            }
+            errors.push(format!("{}: {}", id.fmt_short(), status.error.unwrap_or_default()));
+        }
+        anyhow::bail!(
+            "this machine signed its own removal, but no other member answered to take it: {}. The machine is out of \
+             the cluster for good; run `imesh logout` again when a member is up, so the removal reaches the others",
+            errors.join("; ")
+        )
+    }
+
+    /// Whether this machine is the only member of its cluster and keeps no app files. Such a
+    /// machine may leave its cluster for another with nothing lost: a reset deletes the app files.
+    pub fn alone(&self) -> bool {
+        let no_app_files = match std::fs::read_dir(self.store.dir().join("app")) {
+            Ok(mut d) => d.next().is_none(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        self.cluster().is_some() && self.members().iter().all(|id| *id == self.id()) && no_app_files
+    }
+
+    /// Renames member `id`. A machine renames itself; the owner and admins rename anyone. Names
+    /// are unique.
+    pub fn rename_member(&self, caller: Caller, id: EndpointId, name: &str) -> Result<()> {
         valid_name(name)?;
         let snap = self.store.snapshot();
-        ensure!(snap.members.get(&id).is_some_and(|m| !m.removed), "not a member");
+        ensure!(snap.is_member(&id), "not a member");
         ensure!(
-            !snap.members.iter().any(|(other, m)| !m.removed && m.name == name && *other != id),
+            !snap.members.iter().any(|(other, m)| m.name.eq_ignore_ascii_case(name) && *other != id),
             "name {name:?} is taken"
         );
         let hex = name.len() >= 4 && name.chars().all(|c| c.is_ascii_hexdigit());
@@ -219,108 +268,60 @@ impl Machine {
                 .any(|other| *other != id && other.to_string().starts_with(&name.to_ascii_lowercase())),
             "name {name:?} is the start of another member's ID; pick another name"
         );
-        let (key, name) = (id.to_string(), name.to_string());
-        self.store
-            .write(move |c| c.execute("UPDATE imesh_members SET name = ?2 WHERE id = ?1", params![key, name]))
-            .await?;
-        Ok(())
-    }
-
-    /// Removes a member for good. It must reset and join with a new key to come back. Its open
-    /// connections close.
-    pub async fn remove_member(&self, id: EndpointId) -> Result<()> {
-        ensure!(id != self.id(), "a machine cannot remove itself; connect through another machine");
-        ensure!(self.members().contains(&id), "not a member");
-        let key = id.to_string();
-        self.store
-            .write(|c| {
-                c.execute("UPDATE imesh_members SET removed = 1 WHERE id = ?1", params![key])?;
-                c.execute("DELETE FROM imesh_machines WHERE id = ?1", params![key])
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// Leaves the cluster for good, before this machine's data is deleted: a member that is up
-    /// removes this machine, as `imesh rm` would. The removal is written on a member that
-    /// stays, so it reaches the others even after this machine is gone. Returns that member and
-    /// the devtunnel this machine hosts, for the caller to delete after the daemon stops; deleted
-    /// now, the running host would create a new one. Fails if no other member answers.
-    pub async fn leave(&self) -> Result<(EndpointId, Option<String>)> {
-        ensure!(self.cluster().is_some(), "machine is not in a cluster");
-        let me = self.id();
-        let others: Vec<EndpointId> = self.members().into_iter().filter(|id| *id != me).collect();
-        ensure!(!others.is_empty(), "this machine is the only member; there is no cluster to tell");
-        let mut errors = Vec::new();
-        for id in others {
-            match self.call_member(id, "cluster.leave", serde_json::Value::Null).await {
-                Ok(_) => return Ok((id, self.exposed.borrow().as_ref().map(|h| h.tunnel.clone()))),
-                Err(e) => errors.push(format!("{}: {e:#}", id.fmt_short())),
+        ensure!(
+            id == self.id() || matches!(self.role(), Some(Role::Owner | Role::Admin)),
+            "only the owner and admins can rename other machines; run this on {}",
+            self.deciders(&snap)
+        );
+        let allowed = |r: &Roster| match caller {
+            Caller::Member(by) if by == id => {
+                ensure!(r.is_member(&by), "a machine outside the cluster cannot rename itself");
+                Ok(())
             }
+            _ => caller_may(r, caller, decides, "rename another machine"),
+        };
+        self.store.sign_if(self.endpoint.secret_key(), allowed, |_| Change::Rename { id, name: name.to_string() })
+    }
+
+    /// Makes plain member `id` an admin. Only the owner may.
+    pub fn promote(&self, id: EndpointId) -> Result<()> {
+        let snap = self.store.snapshot();
+        ensure!(snap.role(&id) == Some(Role::Member), "{} is not a plain member", id.fmt_short());
+        ensure!(self.role() == Some(Role::Owner), "only the owner can promote; run this on {}", self.owner_name(&snap));
+        self.store.sign(self.endpoint.secret_key(), Change::Promote { id })
+    }
+
+    fn owner_name(&self, snap: &crate::state::Snapshot) -> String {
+        if self.cut_off.load(std::sync::atomic::Ordering::Relaxed) {
+            return REMOVED.into();
         }
-        anyhow::bail!("no other member answered: {}", errors.join("; "))
+        snap.members.values().find(|m| m.role == Role::Owner).map_or_else(|| "the owner".into(), |m| m.name.clone())
     }
 
-    /// Whether this machine is the only member of its cluster, and the cluster holds no `kv`
-    /// rows and no app rows. Such a machine may leave its cluster for another with nothing lost.
-    pub async fn alone_and_empty(&self) -> Result<bool> {
-        if self.cluster().is_none() || self.members().iter().any(|id| *id != self.id()) {
-            return Ok(false);
+    /// Makes this machine the owner with the recovery code. The root key is used once and kept
+    /// nowhere.
+    pub fn recover(&self, code: &str) -> Result<()> {
+        let root = root_from_code(code)?;
+        let snap = self.store.snapshot();
+        let cluster = snap.cluster.as_ref().context("machine is not in a cluster")?;
+        ensure!(root.public().to_string() == cluster.id, "this recovery code is for another cluster");
+        let name = snap.members.get(&self.id()).context("machine is not a member")?.name.clone();
+        self.store.recover(&root, self.endpoint.secret_key(), name)
+    }
+
+    /// Every member, with its info and how the last hello with it went. With `probe`, says hello
+    /// to every member first.
+    pub async fn machines(&self, probe: bool) -> Vec<MachineRow> {
+        if probe {
+            self.hello_all().await;
         }
-        let tables: Vec<String> = self.store.tables().0.keys().filter(|t| !t.starts_with("imesh_")).cloned().collect();
-        self.store
-            .query(move |c| {
-                let mut empty =
-                    c.query_row("SELECT NOT EXISTS (SELECT 1 FROM imesh_kv)", [], |r| r.get::<_, bool>(0))?;
-                for t in &tables {
-                    empty &= c.query_row(&format!("SELECT NOT EXISTS (SELECT 1 FROM \"{t}\")"), [], |r| {
-                        r.get::<_, bool>(0)
-                    })?;
-                }
-                Ok(empty)
-            })
-            .await
-    }
-
-    /// Accepts `member`'s request to leave. The reply goes first: the removal closes the
-    /// member's connections, also the one that carries the reply.
-    pub fn accept_leave(&self, member: EndpointId) -> Result<()> {
-        ensure!(member != self.id(), "a machine cannot remove itself; connect through another machine");
-        ensure!(self.members().contains(&member), "not a member");
-        let m = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(REPLY_TIMEOUT).await;
-            if let Err(e) = m.remove_member(member).await {
-                tracing::warn!(member = %member.fmt_short(), "could not remove the member that left: {e:#}");
-            }
-        });
-        Ok(())
-    }
-
-    /// Calls an API method on another member over iroh, as this machine.
-    async fn call_member(&self, id: EndpointId, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let conn = self.connect(id, crate::api::API_ALPN).await?;
-        let (send, recv) = conn.open_bi().await?;
-        let req = crate::api::Request { to: None, method: method.into(), params };
-        let reply = tokio::time::timeout(
-            Duration::from_secs(30),
-            crate::api::call(crate::api::framed(tokio::io::join(recv, send)), &req),
-        )
-        .await
-        .context("no reply")??;
-        conn.close(0u32.into(), b"done");
-        Ok(reply)
-    }
-
-    /// Every member, with its info and how this machine sees it now.
-    pub fn machines(&self) -> Vec<MachineRow> {
         let snap = self.store.snapshot();
         snap.members
             .iter()
-            .filter(|(_, m)| !m.removed)
             .map(|(id, m)| MachineRow {
                 id: *id,
                 name: m.name.clone(),
+                role: m.role,
                 info: snap.machine(id),
                 status: self.peer_status(id),
             })
@@ -328,60 +329,18 @@ impl Machine {
     }
 
     /// Makes every machine use exactly these relays. No relays: each machine goes back to the
-    /// relays it started with.
-    pub async fn set_cluster_relays(&self, settings: &RelaySettings) -> Result<()> {
-        let value = serde_json::to_string(settings)?;
-        self.store.write(|c| upsert(c, "imesh_settings", "key", "value", "relays", &value)).await?;
-        Ok(())
-    }
-
-    /// Adds or grows app tables on every machine: `CREATE TABLE` and `CREATE INDEX` statements.
-    /// They apply here first, so a change that cannot apply (dropping or changing a table or
-    /// column) fails here and reaches no one. Members take the new tables over their links
-    /// before any row that uses them.
-    pub async fn apply_schema(&self, sql: &str) -> Result<()> {
-        for name in schema::table_names(&[sql.to_string()])? {
-            ensure!(
-                !name.to_ascii_lowercase().starts_with("imesh_"),
-                "table {name}: tables named imesh_* belong to imesh"
-            );
-        }
-        self.store.apply_schema(vec![sql.to_string()]).await
-    }
-
-    /// Writes a JSON value to the built-in `imesh_kv` table. `None` deletes the key. With `ttl`,
-    /// the key expires that long from now, by this machine's clock: reads do not show it after
-    /// that, and [`Machine::kv_expire`] deletes it.
-    pub async fn kv_put(&self, key: &str, value: Option<&serde_json::Value>, ttl: Option<Duration>) -> Result<()> {
-        match value {
-            Some(v) => {
-                let v = serde_json::to_string(v)?;
-                let expires = ttl.map(|t| now_secs() + t.as_secs() as i64);
-                self.store
-                    .write(|c| {
-                        c.execute(
-                            "INSERT INTO imesh_kv (key, value, expires_at) VALUES (?1, ?2, ?3) \
-                             ON CONFLICT (key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
-                            params![key, v, expires],
-                        )
-                    })
-                    .await?
-            }
-            None => self.store.write(|c| c.execute("DELETE FROM imesh_kv WHERE key = ?1", params![key])).await?,
-        };
-        Ok(())
-    }
-
-    /// Deletes the keys that expired more than [`KV_EXPIRE_GRACE`] ago. Every machine runs it; a key
-    /// that another machine set again since it expired has a new `expires_at`, so the delete
-    /// leaves it alone.
-    pub(crate) async fn kv_expire(&self) -> Result<usize> {
-        let before = now_secs() - KV_EXPIRE_GRACE.as_secs() as i64;
-        self.store
-            .write(|c| {
-                c.execute("DELETE FROM imesh_kv WHERE expires_at IS NOT NULL AND expires_at < ?1", params![before])
-            })
-            .await
+    /// relays it started with. Only the owner and admins may.
+    pub async fn set_cluster_relays(&self, caller: Caller, settings: &RelaySettings) -> Result<()> {
+        let snap = self.store.snapshot();
+        ensure!(
+            matches!(self.role(), Some(Role::Owner | Role::Admin)),
+            "only the owner and admins can set the cluster relays; run this on {}",
+            self.deciders(&snap)
+        );
+        let relays =
+            Relays { urls: settings.relays.iter().map(|u| u.to_string()).collect(), token: settings.token.clone() };
+        let allowed = |r: &Roster| caller_may(r, caller, decides, "set the cluster relays");
+        self.store.sign_if(self.endpoint.secret_key(), allowed, |_| Change::Relays(relays))
     }
 
     /// Asks the owner of the machine to reset it: a new key, out of any cluster, with its data
@@ -392,7 +351,27 @@ impl Machine {
 
     /// Resets after the reply to the current API call has left: the API handler calls
     /// [`Machine::finish_reset`] then. A fallback timer resets anyway.
-    pub(super) fn reset_after_reply(&self) {
+    /// Resets this machine for `caller` once the reply has left: a new key, out of any cluster,
+    /// with its data deleted. A remote caller may only where it could remove this machine. With
+    /// `if_alone`, only while [`Machine::alone`] holds, so a caller that saw it alone loses
+    /// nothing that came after. The checks and the decision run under the roster lock, so no
+    /// roster change lands between them.
+    pub fn reset(&self, caller: Caller, if_alone: bool) -> Result<()> {
+        self.store.locked(|r| {
+            if let Caller::Member(_) = caller {
+                let r = r.context("machine is not in a cluster")?;
+                let theirs = r.role(&self.id());
+                let may =
+                    |mine| mine == Some(Role::Owner) || (mine == Some(Role::Admin) && theirs == Some(Role::Member));
+                caller_may(r, caller, may, "reset this machine")?;
+            }
+            ensure!(!if_alone || self.alone(), "the machine has other members or app files now; it was not reset");
+            self.reset_after_reply();
+            Ok(())
+        })
+    }
+
+    fn reset_after_reply(&self) {
         self.reset_after_reply.store(true, std::sync::atomic::Ordering::Relaxed);
         let m = self.clone();
         tokio::spawn(async move {
@@ -416,57 +395,133 @@ mod tests {
 
     #[test]
     fn names_are_checked() {
-        for ok in ["mac", "dev-box_1", "a.b"] {
+        for ok in ["mac", "dev-box_1"] {
             valid_name(ok).unwrap();
         }
-        for bad in ["", "self", "SELF", "a b", "a/b"] {
+        for bad in ["", "self", "SELF", "a b", "a/b", "a.b", "a@b"] {
             assert!(valid_name(bad).is_err(), "{bad:?}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn kv_ttl_and_a_machine_alone_with_nothing_in_its_cluster() {
+    async fn a_new_cluster_has_this_machine_alone_as_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = Builder::new(Config::new(dir.path())).spawn().await.unwrap();
+        let m = running.machine.clone();
+        assert!(!m.alone(), "in no cluster");
+        let init = m.init_cluster(Some("one".into())).await.unwrap();
+        assert!(m.alone(), "alone");
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        assert!(m.alone(), "an empty app directory holds nothing");
+        std::fs::write(dir.path().join("app/data"), "x").unwrap();
+        assert!(!m.alone(), "a reset would delete the app files");
+        assert!(m.reset(Caller::Local, true).is_err(), "a caller that saw it alone resets nothing now");
+        assert_eq!(m.role(), Some(Role::Owner));
+        assert_eq!(root_from_code(&init.recovery_code).unwrap().public().to_string(), init.cluster);
+        running.shutdown().await.unwrap();
+    }
+
+    /// Two machines in one cluster, with b's copy taken from the ticket, as a join takes it, and
+    /// no hello between them.
+    async fn pair(dir: &std::path::Path) -> (super::super::Running, super::super::Running) {
+        let a = Builder::new(Config::new(dir.join("a"))).spawn().await.unwrap();
+        let b = Builder::new(Config::new(dir.join("b"))).spawn().await.unwrap();
+        a.machine.init_cluster(Some("a".into())).await.unwrap();
+        let ticket = a.machine.admit(Caller::Local, b.machine.id(), "b", None).await.unwrap();
+        b.machine.store.merge(ticket.roster, Some(a.machine.store.roster().unwrap().network)).await.unwrap();
+        (a, b)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_caller_acts_through_a_machine_only_with_its_own_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path()).await;
+        let (m, b_id) = (a.machine.clone(), Caller::Member(b.machine.id()));
+        let other = iroh::SecretKey::generate().public();
+        assert!(m.admit(b_id, other, "other", None).await.is_err(), "a plain member cannot add");
+        assert!(m.set_cluster_relays(b_id, &RelaySettings::default()).await.is_err());
+        m.rename_member(b_id, b.machine.id(), "bee").unwrap();
+        assert!(m.rename_member(b_id, m.id(), "aye").is_err(), "a plain member renames only itself");
+        assert!(m.reset(b_id, false).is_err(), "a plain member cannot reset the owner");
+        assert!(m.reset(Caller::Local, true).is_err(), "a has a member, so it is not alone");
+        m.promote(b.machine.id()).unwrap();
+        m.admit(b_id, other, "other", None).await.unwrap();
+        // Once removed, b acts through a no more, also when it passed a check before.
+        m.remove_member(Caller::Local, b.machine.id(), true).await.unwrap();
+        let next = iroh::SecretKey::generate().public();
+        assert!(m.admit(b_id, next, "next", None).await.is_err());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loopback_relay_of_another_machine_is_dropped_unless_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let running = Builder::new(Config::new(dir.path())).spawn().await.unwrap();
+        let m = running.machine.clone();
+        m.init_cluster(Some("one".into())).await.unwrap();
+        let (lan, local, public): (std::net::SocketAddr, iroh::RelayUrl, iroh::RelayUrl) = (
+            "192.0.2.1:5".parse().unwrap(),
+            "http://127.0.0.1:4000/".parse().unwrap(),
+            "https://relay.example/".parse().unwrap(),
+        );
+        let peer = iroh::SecretKey::generate().public();
+        let published = iroh::EndpointAddr::from_parts(
+            peer,
+            [
+                iroh::TransportAddr::Ip(lan),
+                iroh::TransportAddr::Relay(local.clone()),
+                iroh::TransportAddr::Relay(public.clone()),
+            ],
+        );
+        let addr = m.reachable(published.clone());
+        assert!(addr.ip_addrs().any(|a| *a == lan));
+        assert!(addr.relay_urls().any(|u| *u == public));
+        assert!(!addr.relay_urls().any(|u| *u == local), "the peer's own loopback relay is no use here");
+        let shared = RelaySettings { relays: vec![local.clone()], token: None };
+        m.set_cluster_relays(Caller::Local, &shared).await.unwrap();
+        assert!(m.reachable(published).relay_urls().any(|u| *u == local), "a shared loopback relay stays");
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_the_devtunnel_mesh_a_loopback_relay_of_another_machine_is_always_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::new(dir.path());
-        config.net.gossip_port_base = Some(40000);
+        config.net.devtunnel_mesh = true;
         let running = Builder::new(config).spawn().await.unwrap();
         let m = running.machine.clone();
-        assert!(!m.alone_and_empty().await.unwrap(), "in no cluster");
         m.init_cluster(Some("one".into())).await.unwrap();
-        assert!(m.alone_and_empty().await.unwrap(), "alone, with no rows");
-
-        let get = |m: Machine, key: &'static str| async move {
-            m.state()
-                .query(move |c| {
-                    c.query_row(
-                        "SELECT value FROM imesh_kv WHERE key = ?1 AND (expires_at IS NULL OR expires_at >= ?2)",
-                        params![key, now_secs()],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                })
-                .await
-                .unwrap()
-        };
-        use rusqlite::OptionalExtension;
-        m.kv_put("keep", Some(&"v".into()), None).await.unwrap();
-        assert!(!m.alone_and_empty().await.unwrap(), "a kv row counts as data");
-        m.kv_put("short", Some(&"v".into()), Some(Duration::from_secs(3600))).await.unwrap();
-        assert_eq!(get(m.clone(), "short").await.as_deref(), Some("\"v\""));
-        m.state()
-            .write(|c| c.execute("UPDATE imesh_kv SET expires_at = ?1 WHERE key = 'short'", params![now_secs() - 5]))
-            .await
-            .unwrap();
-        assert_eq!(get(m.clone(), "short").await, None, "an expired key is not read");
-        assert_eq!(m.kv_expire().await.unwrap(), 0, "kept during the grace period");
-        m.state()
-            .write(|c| {
-                c.execute("UPDATE imesh_kv SET expires_at = ?1 WHERE key = 'short'", params![now_secs() - 2 * 3600])
-            })
-            .await
-            .unwrap();
-        assert_eq!(m.kv_expire().await.unwrap(), 1, "deleted after the grace period");
-        assert_eq!(get(m.clone(), "keep").await.as_deref(), Some("\"v\""), "a key with no TTL stays");
+        let (local, public): (iroh::RelayUrl, iroh::RelayUrl) =
+            ("http://127.0.0.1:4000/".parse().unwrap(), "https://relay.example/".parse().unwrap());
+        let published = iroh::EndpointAddr::from_parts(
+            iroh::SecretKey::generate().public(),
+            [iroh::TransportAddr::Relay(local.clone()), iroh::TransportAddr::Relay(public.clone())],
+        );
+        let addr = m.reachable(published.clone());
+        assert!(addr.relay_urls().any(|u| *u == public), "a public relay stays");
+        assert!(!addr.relay_urls().any(|u| *u == local), "this machine reaches the peer through its own forward");
+        let initial = RelaySettings { relays: vec![local.clone()], token: None };
+        m.set_cluster_relays(Caller::Local, &initial).await.unwrap();
+        let again = m.reachable(published);
+        assert_eq!(
+            again.relay_urls().filter(|u| **u == local).count(),
+            1,
+            "the cluster relay is added once, as a cluster relay"
+        );
         running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leave_that_no_member_answered_runs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = pair(dir.path()).await;
+        a.shutdown().await.unwrap();
+        for _ in 0..2 {
+            let e = b.machine.leave().await.unwrap_err().to_string();
+            assert!(e.contains("no other member answered"), "{e}");
+        }
+        assert!(b.machine.store.read(|s| s.is_removed(&b.machine.id())));
+        b.shutdown().await.unwrap();
     }
 }

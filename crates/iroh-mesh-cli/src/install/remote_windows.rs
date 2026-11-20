@@ -98,7 +98,7 @@ struct Status {
     running: bool,
     cluster: Option<String>,
     #[serde(default)]
-    alone_and_empty: bool,
+    alone: bool,
 }
 
 pub(super) async fn provision(target: &Target, ssh: &Ssh, mode: Mode) -> Result<Client> {
@@ -120,7 +120,7 @@ pub(super) async fn provision(target: &Target, ssh: &Ssh, mode: Mode) -> Result<
         Mode::New | Mode::NewCluster => {
             if let Some(s) = &status
                 && let Some(c) = &s.cluster
-                && (mode == Mode::NewCluster || !s.alone_and_empty)
+                && (mode == Mode::NewCluster || !s.alone)
             {
                 bail!("{} is already in cluster {c}; run `imesh logout` there first", ssh.dest());
             }

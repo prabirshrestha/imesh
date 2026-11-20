@@ -145,12 +145,22 @@ enum Cmd {
         #[arg(value_parser = crate::args::member_name)]
         name: String,
     },
-    /// Remove a machine from the cluster and reset it.
+    /// Make a plain member an admin: it can add machines and remove plain members. Only the owner
+    /// can do this.
+    Promote { machine: String },
+    /// Make this machine the owner with the recovery code, read from stdin. Use it when the
+    /// owner is lost.
+    Recover,
+    /// Remove a machine from the cluster and reset it. The owner removes anyone; admins remove
+    /// plain members.
     Rm {
         machine: String,
         /// Remove it even though it serves a relay that the cluster uses.
         #[arg(long)]
         force: bool,
+        /// Also undo every machine it added, promoted, or removed: for a stolen machine.
+        #[arg(long)]
+        cascade: bool,
         #[command(flatten)]
         out: OutputArgs,
     },
@@ -193,9 +203,6 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
-    /// Small values that every machine has a copy of. The last write wins.
-    #[command(subcommand)]
-    Kv(KvCmd),
     /// Configure this computer to use the cluster in more ways.
     #[command(subcommand)]
     Configure(ConfigureCmd),
@@ -254,32 +261,6 @@ enum UpdateCmd {
 }
 
 #[derive(Subcommand)]
-enum KvCmd {
-    /// Set a value on every machine. The value is JSON, or a string when it is not JSON.
-    Set {
-        key: String,
-        value: String,
-        /// Remove the key after this long, for example 30s, 10m, 12h, or 7d.
-        #[arg(long, value_parser = crate::args::parse_period)]
-        ttl: Option<std::time::Duration>,
-    },
-    /// Print a value from this machine's copy.
-    Get {
-        key: String,
-        #[command(flatten)]
-        out: OutputArgs,
-    },
-    /// List the keys and values, or those whose key starts with a prefix.
-    Ls {
-        prefix: Option<String>,
-        #[command(flatten)]
-        out: OutputArgs,
-    },
-    /// Remove a key from every machine.
-    Rm { key: String },
-}
-
-#[derive(Subcommand)]
 enum DevCmd {
     /// Call an API method.
     Call {
@@ -293,22 +274,6 @@ enum DevCmd {
         #[arg(long, short)]
         machine: Option<String>,
     },
-    /// Query this machine's copy of the database, or change rows on every machine with --exec.
-    Sql {
-        /// One SQL statement. Without --exec it must be read-only.
-        sql: String,
-        /// Parameters for ?1, ?2, ... as JSON values.
-        #[arg(long = "param", short)]
-        params: Vec<String>,
-        /// Change rows: run the statement in a transaction and send the change to every machine.
-        #[arg(long)]
-        exec: bool,
-    },
-    /// Apply CREATE TABLE and CREATE INDEX statements from a file. Every machine takes the new
-    /// tables before any row that uses them. A table that exists may only grow.
-    SchemaApply { file: PathBuf },
-    /// List this machine's tables, and for each member whether rows pass.
-    SchemaLs,
 }
 
 #[derive(Subcommand)]
@@ -518,7 +483,7 @@ async fn status(socket: PathBuf) -> Result<()> {
         json!({
             "running": inspect.is_some(),
             "cluster": inspect.as_ref().and_then(|i| i.cluster.clone()),
-            "alone_and_empty": inspect.as_ref().is_some_and(|i| i.alone_and_empty),
+            "alone": inspect.as_ref().is_some_and(|i| i.alone),
         })
     );
     Ok(())
@@ -622,30 +587,20 @@ async fn api(at: &At, c: &Client, cmd: Cmd) -> Result<()> {
             c.call::<Value>(None, "cluster.rename", json!({ "id": id, "name": name })).await?;
             println!("renamed {machine} to {name}");
         }
-        Cmd::Rm { machine, force, out } => machine::rm(at, c, &machine, force, &out.output()?).await?,
-        Cmd::Kv(KvCmd::Set { key, value, ttl }) => {
-            let value: Value = serde_json::from_str(&value).unwrap_or(Value::String(value));
-            c.call::<Value>(None, "kv.put", json!({ "key": key, "value": value, "ttl": ttl.map(|t| t.as_secs()) }))
-                .await?;
+        Cmd::Rm { machine, force, cascade, out } => {
+            machine::rm(at, c, &machine, force, cascade, &out.output()?).await?
         }
-        Cmd::Kv(KvCmd::Get { key, out }) => {
-            let v: Value = c.call(None, "kv.get", json!({ "key": key })).await?;
-            out.output()?.print(&v, |v| match v {
-                Value::Null => {}
-                Value::String(s) => println!("{s}"),
-                v => println!("{v}"),
-            })?;
+        Cmd::Promote { machine } => {
+            let id = machine::resolve(c, &machine).await?;
+            c.call::<Value>(None, "cluster.promote", json!({ "id": id })).await?;
+            println!("{machine} is an admin: it can add machines and remove plain members");
         }
-        Cmd::Kv(KvCmd::Ls { prefix, out }) => {
-            let v: Value = c.call(None, "kv.list", json!({ "prefix": prefix.unwrap_or_default() })).await?;
-            out.output()?.print(&v, |v| {
-                for (k, v) in v.as_object().into_iter().flatten() {
-                    println!("{k}\t{v}");
-                }
-            })?;
-        }
-        Cmd::Kv(KvCmd::Rm { key }) => {
-            c.call::<Value>(None, "kv.rm", json!({ "key": key })).await?;
+        Cmd::Recover => {
+            eprintln!("paste the recovery code, then press Enter:");
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            c.call::<Value>(None, "cluster.recover", json!({ "code": code.trim() })).await?;
+            println!("this machine is now the owner");
         }
         Cmd::Relay(RelayCmd::Ls) => {
             let r: RelaysInfo = c.call(None, "relays.get", ()).await?;
@@ -654,29 +609,6 @@ async fn api(at: &At, c: &Client, cmd: Cmd) -> Result<()> {
         Cmd::Relay(RelayCmd::Set { urls, token }) => {
             c.call::<Value>(None, "relays.set", json!({ "relays": urls, "token": token })).await?;
             println!("cluster relays set; every machine switches within about 10 s");
-        }
-        Cmd::Dev(DevCmd::SchemaApply { file }) => {
-            let sql = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-            c.call::<Value>(None, "schema.apply", json!({ "sql": sql })).await?;
-            println!("applied here; members take the tables before any row that uses them");
-        }
-        Cmd::Dev(DevCmd::SchemaLs) => {
-            let v: Value = c.call(None, "schema.list", ()).await?;
-            println!("{}", serde_json::to_string_pretty(&v)?);
-        }
-        Cmd::Dev(DevCmd::Sql { sql, params, exec }) => {
-            let params = params
-                .iter()
-                .map(|p| serde_json::from_str(p).or_else(|_| Ok::<_, anyhow::Error>(Value::String(p.clone()))))
-                .collect::<Result<Vec<Value>>>()?;
-            let stmt = json!({ "sql": sql, "params": params });
-            if exec {
-                let counts: Vec<usize> = c.call(None, "sql.execute", json!({ "statements": [stmt] })).await?;
-                println!("{} rows changed", counts.iter().sum::<usize>());
-            } else {
-                let v: Value = c.call(None, "sql.query", stmt).await?;
-                print_rows(&v);
-            }
         }
         Cmd::Dev(DevCmd::Call { method, params, params_stdin, machine }) => {
             let to = match machine {
@@ -738,21 +670,6 @@ impl At {
             f(ctx);
             Ok(())
         })
-    }
-}
-
-/// Prints `sql.query` results as a tab-separated table with a header.
-fn print_rows(v: &Value) {
-    let cell = |c: &Value| match c {
-        Value::String(s) => s.clone(),
-        Value::Null => "NULL".into(),
-        other => other.to_string(),
-    };
-    if let Some(cols) = v["columns"].as_array() {
-        println!("{}", cols.iter().map(cell).collect::<Vec<_>>().join("\t"));
-    }
-    for row in v["rows"].as_array().into_iter().flatten() {
-        println!("{}", row.as_array().into_iter().flatten().map(cell).collect::<Vec<_>>().join("\t"));
     }
 }
 

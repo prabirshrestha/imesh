@@ -1,6 +1,6 @@
-//! The devtunnel mesh: this machine forwards every other member's relay tunnel to that member's
-//! own loopback port, with this machine's devtunnel login. `http://127.0.0.1:<port>` then names
-//! the same relay on every member, so published addresses work unchanged.
+//! The devtunnel mesh: this machine forwards every other member's relay tunnel to a loopback
+//! port, with this machine's devtunnel login. The port is the member's own port, or another one
+//! when that is in use here, so each machine names a member's relay by its own forward.
 //!
 //! Each forward has one owner, a task that holds the `devtunnel connect` child and starts it
 //! again when it stops. A forward is ready only while its child runs. The tasks hold no
@@ -21,7 +21,8 @@ use crate::{net, state::TunnelEndpoint};
 
 struct Forward {
     endpoint: TunnelEndpoint,
-    ready: Arc<Mutex<bool>>,
+    /// The local port while the forward runs.
+    ready: Arc<Mutex<Option<u16>>>,
     /// Set for a forward from a join ticket or an admission, until the member's row arrives.
     pinned: bool,
     _task: AbortOnDropHandle<()>,
@@ -59,14 +60,20 @@ impl Mesh {
     pub fn reconcile(&self, want: &BTreeMap<EndpointId, TunnelEndpoint>) {
         let mut f = self.forwards.lock().unwrap();
         let before = f.len();
-        f.retain(|id, x| match want.get(id) {
-            Some(e) if *e == x.endpoint => {
-                x.pinned = false;
-                true
+        let mut gone = Vec::new();
+        for (id, x) in f.iter_mut() {
+            match want.get(id) {
+                Some(e) if *e == x.endpoint => x.pinned = false,
+                Some(_) => gone.push(*id),
+                None if x.pinned => {}
+                None => gone.push(*id),
             }
-            Some(_) => false,
-            None => x.pinned,
-        });
+        }
+        for id in gone {
+            if let Some(x) = f.remove(&id) {
+                linger(x);
+            }
+        }
         for (id, e) in want {
             if !f.contains_key(id) {
                 f.insert(*id, self.start(*id, e.clone(), false));
@@ -83,20 +90,15 @@ impl Mesh {
         self.changed.send_modify(|v| *v += 1);
     }
 
-    /// The relays of the forwards that run now.
-    pub fn ready_urls(&self) -> Vec<RelayUrl> {
-        self.forwards
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|x| *x.ready.lock().unwrap())
-            .map(|x| x.endpoint.relay_url())
-            .collect()
+    /// The relays of the forwards that run now, and whose they are.
+    pub fn ready_urls(&self) -> Vec<(EndpointId, RelayUrl)> {
+        let f = self.forwards.lock().unwrap();
+        f.iter().filter_map(|(id, x)| Some((*id, local_url((*x.ready.lock().unwrap())?)))).collect()
     }
 
     /// Whether `id`'s forward runs now, and its endpoint.
     pub fn status(&self, id: &EndpointId) -> Option<(TunnelEndpoint, bool)> {
-        self.forwards.lock().unwrap().get(id).map(|x| (x.endpoint.clone(), *x.ready.lock().unwrap()))
+        self.forwards.lock().unwrap().get(id).map(|x| (x.endpoint.clone(), x.ready.lock().unwrap().is_some()))
     }
 
     /// Stops every forward. The machine is stopping.
@@ -105,12 +107,12 @@ impl Mesh {
     }
 
     fn start(&self, id: EndpointId, endpoint: TunnelEndpoint, pinned: bool) -> Forward {
-        let ready = Arc::new(Mutex::new(false));
+        let ready = Arc::new(Mutex::new(None));
         let TunnelEndpoint::Devtunnel { id: tunnel, port } = endpoint.clone();
         let connect = net::DevTunnel { id: tunnel, port };
         let flag = ready.clone();
         let changed = self.changed.clone();
-        let set = move |v: bool| {
+        let set = move |v: Option<u16>| {
             let mut r = flag.lock().unwrap();
             if *r != v {
                 *r = v;
@@ -123,16 +125,16 @@ impl Mesh {
             let mut backoff = Duration::from_secs(1);
             loop {
                 match connect.run_once(cli.as_deref()).await {
-                    Ok(mut child) => {
-                        info!(member = %id.fmt_short(), tunnel = %connect.id, port, "mesh relay forwarded");
-                        set(true);
+                    Ok((mut child, local)) => {
+                        info!(member = %id.fmt_short(), tunnel = %connect.id, port, local, "mesh relay forwarded");
+                        set(Some(local));
                         backoff = Duration::from_secs(1);
-                        let why = connect.watch(&mut child).await.unwrap_or_else(|e| format!("{e:#}"));
-                        set(false);
+                        let why = connect.watch(&mut child, local).await.unwrap_or_else(|e| format!("{e:#}"));
+                        set(None);
                         warn!(member = %id.fmt_short(), "mesh relay forward stopped ({why}); starting it again");
                     }
                     Err(e) => {
-                        set(false);
+                        set(None);
                         warn!(member = %id.fmt_short(), "mesh relay: {e:#}");
                     }
                 }
@@ -142,4 +144,26 @@ impl Mesh {
         });
         Forward { endpoint, ready, pinned, _task: AbortOnDropHandle::new(task) }
     }
+}
+
+/// How long a forward that the roster no longer wants keeps running. A member that was removed
+/// is reached only through its own relay, which is this forward. The answer to its leave, and the
+/// close that tells it that it is removed, go through it. It must outlive
+/// the relay grace in `admission`.
+const FORWARD_GRACE: Duration = Duration::from_secs(5);
+
+fn linger(forward: Forward) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(async move {
+                tokio::time::sleep(FORWARD_GRACE).await;
+                drop(forward);
+            });
+        }
+        Err(_) => drop(forward),
+    }
+}
+
+fn local_url(port: u16) -> RelayUrl {
+    format!("http://127.0.0.1:{port}/").parse().expect("loopback URL")
 }

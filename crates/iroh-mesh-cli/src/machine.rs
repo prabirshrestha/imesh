@@ -30,6 +30,9 @@ pub struct Installed {
     pub name: String,
     pub target: String,
     pub cluster: Option<String>,
+    /// Shown once when a cluster starts. It moves the owner if that machine is lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,6 +82,7 @@ async fn add_new(at: &At, target: Target, out: &Output) -> Result<()> {
         name,
         target: target.dest.clone(),
         cluster: v["cluster"].as_str().map(String::from),
+        recovery_code: v["recovery_code"].as_str().map(String::from),
         members: Some(1),
         context: Some(ctx),
         ssh_alias,
@@ -87,9 +91,18 @@ async fn add_new(at: &At, target: Target, out: &Output) -> Result<()> {
     };
     out.print(&r, |r| {
         println!("cluster {} started on {} ({})", r.cluster.as_deref().unwrap_or_default(), r.target, r.id);
+        if let Some(code) = &r.recovery_code {
+            print_recovery_code(code);
+        }
         println!("current context is now {:?}", r.context.as_deref().unwrap_or_default());
         print_alias(r);
     })
+}
+
+/// Prints the recovery code with what it is for. No machine keeps it, so this is the only copy.
+pub(crate) fn print_recovery_code(code: &str) {
+    println!("recovery code: {code}");
+    println!("Keep this code. It moves the owner to another machine if this one is lost. No machine keeps it.");
 }
 
 fn print_alias(r: &Installed) {
@@ -148,9 +161,9 @@ async fn add_to(at: &At, entry: &Client, mut target: Target, out: &Output) -> Re
         }
         // A server that ran `imesh up` alone holds its own cluster. With nothing in it, it starts
         // again as a new machine, out of any cluster, and joins.
-        Some(cluster) if i.alone_and_empty => {
+        Some(cluster) if i.alone => {
             eprintln!("{} is alone in its own empty cluster {cluster}; it leaves it to join", target.display());
-            c.call::<Value>(None, "machine.reset", ()).await?;
+            c.call::<Value>(None, "machine.reset", json!({ "if_alone": true })).await?;
             c.close().await;
             (c, i) = reconnect_after_reset(&target, i.id, platform_of(&i)).await?;
         }
@@ -176,6 +189,7 @@ async fn add_to(at: &At, entry: &Client, mut target: Target, out: &Output) -> Re
         name,
         target: target.dest.clone(),
         cluster: Some(joined.cluster.clone()),
+        recovery_code: None,
         members: Some(joined.members),
         context: None,
         ssh_alias,
@@ -241,6 +255,7 @@ async fn finish_local(at: &At, target: &Target, cluster: &str, out: &Output) -> 
         name,
         target: target.dest.clone(),
         cluster: i.cluster.clone(),
+        recovery_code: None,
         members: None,
         context: None,
         ssh_alias,
@@ -265,6 +280,7 @@ pub(crate) async fn update(mut target: Target, out: &Output) -> Result<()> {
         name,
         target: target.dest.clone(),
         cluster: i.cluster.clone(),
+        recovery_code: None,
         members: None,
         context: None,
         ssh_alias,
@@ -287,12 +303,20 @@ pub(crate) async fn resolve(c: &Client, m: &str) -> Result<EndpointId> {
 pub(crate) fn pick<'a>(rows: &'a [MachineRow], m: &str) -> Result<&'a MachineRow> {
     let by = |f: &dyn Fn(&MachineRow) -> bool| rows.iter().filter(|r| f(r)).collect::<Vec<_>>();
     let named = by(&|r| r.name == m);
+    let lower = m.to_ascii_lowercase();
+    let ids = if lower.len() >= 4 { by(&|r| r.id.to_string().starts_with(&lower)) } else { Vec::new() };
+    // A member can name itself like the start of another machine's ID. Such a name never wins
+    // silently over that ID.
     if let [one] = named.as_slice() {
+        ensure!(
+            ids.iter().all(|r| r.id == one.id),
+            "{m:?} is the name of {} and the start of the ID of another machine; give the full ID",
+            one.id.fmt_short()
+        );
         return Ok(one);
     }
     ensure!(named.is_empty(), "{} machines are named {m:?}; use the ID from `imesh status`", named.len());
-    let m = m.to_ascii_lowercase();
-    let ids = if m.len() >= 4 { by(&|r| r.id.to_string().starts_with(&m)) } else { Vec::new() };
+    let m = lower;
     match ids.as_slice() {
         [one] => Ok(one),
         [] => bail!("no machine named {m:?} or with an ID that starts with it; see `imesh status`"),
@@ -354,7 +378,7 @@ pub(crate) async fn ping(c: &Client, m: &str, count: u32, until_direct: bool, ou
 }
 
 pub(crate) async fn ls(c: &Client, wide: bool, out: &Output) -> Result<()> {
-    let rows: Vec<MachineRow> = c.call(None, "cluster.machines", ()).await?;
+    let rows: Vec<MachineRow> = c.call(None, "cluster.machines", json!({ "probe": true })).await?;
     out.print(&rows, |rows| print_machines(rows, wide))
 }
 
@@ -402,7 +426,7 @@ const NAME_MAX: usize = 24;
 
 fn print_machines(rows: &[MachineRow], wide: bool) {
     let w = if wide { 64 } else { 10 };
-    let cells: Vec<[String; 7]> = rows
+    let cells: Vec<[String; 8]> = rows
         .iter()
         .map(|r| {
             let s = &r.status;
@@ -413,6 +437,7 @@ fn print_machines(rows: &[MachineRow], wide: bool) {
             [
                 if wide { r.name.clone() } else { fit(&r.name, NAME_MAX) },
                 r.id.to_string()[..w].to_string(),
+                role_name(r.role).into(),
                 s.state.to_string(),
                 s.path.clone().unwrap_or_else(|| "-".into()),
                 s.rtt_ms.map_or("-".into(), |v| format!("{v}ms")),
@@ -421,7 +446,7 @@ fn print_machines(rows: &[MachineRow], wide: bool) {
             ]
         })
         .collect();
-    table(["NAME", "ID", "STATE", "PATH", "RTT", "OS/ARCH", "VERSION"], &cells);
+    table(["NAME", "ID", "ROLE", "STATE", "PATH", "RTT", "OS/ARCH", "VERSION"], &cells);
     if !wide {
         return;
     }
@@ -434,6 +459,14 @@ fn print_machines(rows: &[MachineRow], wide: bool) {
         if let Some(e) = &s.error {
             println!("{}: error: {e}", r.name);
         }
+    }
+}
+
+pub(crate) fn role_name(role: iroh_mesh::roster::Role) -> &'static str {
+    match role {
+        iroh_mesh::roster::Role::Owner => "owner",
+        iroh_mesh::roster::Role::Admin => "admin",
+        iroh_mesh::roster::Role::Member => "member",
     }
 }
 
@@ -454,11 +487,11 @@ struct Removed {
     ssh_alias: Option<String>,
 }
 
-pub(crate) async fn rm(at: &At, c: &Client, m: &str, force: bool, out: &Output) -> Result<()> {
+pub(crate) async fn rm(at: &At, c: &Client, m: &str, force: bool, cascade: bool, out: &Output) -> Result<()> {
     let id = resolve(c, m).await?;
     let entry: Inspect = c.call(None, "machine.inspect", ()).await?;
     ensure!(entry.id != id, "you are connected through {m}; connect through another machine to remove it");
-    // From the replicated state, so the guard holds also when the machine is down.
+    // From the roster, so the guard holds also when the machine is down.
     let relays: RelaysInfo = c.call(None, "relays.get", ()).await?;
     let rows: Vec<MachineRow> = c.call(None, "cluster.machines", ()).await?;
     let row = rows.into_iter().find(|r| r.id == id);
@@ -479,7 +512,7 @@ pub(crate) async fn rm(at: &At, c: &Client, m: &str, force: bool, out: &Output) 
             Some(format!("{e:#}"))
         }
     };
-    c.call::<Value>(None, "cluster.remove", json!({ "id": id })).await?;
+    c.call::<Value>(None, "cluster.remove", json!({ "id": id, "cascade": cascade })).await?;
     let mut removed_conns = 0;
     at.edit_context(|ctx| {
         let before = ctx.connections.len();
@@ -515,6 +548,7 @@ mod pick_tests {
         MachineRow {
             id: iroh::SecretKey::generate().public(),
             name: name.into(),
+            role: iroh_mesh::roster::Role::Member,
             info: None,
             status: Default::default(),
         }
@@ -530,5 +564,14 @@ mod pick_tests {
         assert_eq!(pick(&rows, &win[..10].to_uppercase()).unwrap().name, "win");
         assert!(pick(&rows, &win[..3]).is_err());
         assert!(pick(&rows, "nope").unwrap_err().to_string().contains("no machine named"));
+    }
+
+    #[test]
+    fn a_name_like_another_machines_id_is_ambiguous() {
+        let mut rows = vec![row("mac"), row("win")];
+        let win = rows[1].id.to_string();
+        rows[0].name = win[..6].to_string();
+        assert!(pick(&rows, &win[..6]).unwrap_err().to_string().contains("start of the ID"));
+        assert_eq!(pick(&rows, &win).unwrap().name, "win");
     }
 }

@@ -32,7 +32,7 @@ const MESH_PREFIX: &str = "imeshpair1-dtm-";
 /// The prefix of a code for pairing over iroh: the base32 of an iroh endpoint ticket follows.
 const IROH_PREFIX: &str = "imeshpair1-ir-";
 /// The ALPN of the temporary pairing endpoint.
-const PAIR_ALPN: &[u8] = b"imesh/pair/0";
+const PAIR_ALPN: &[u8] = b"imesh/pair/1";
 /// How long `invite` waits for the new machine.
 const PAIR_TIME: Duration = Duration::from_secs(15 * 60);
 
@@ -45,8 +45,6 @@ struct Hello {
     arch: String,
     #[serde(default)]
     tunnel: Option<TunnelEndpoint>,
-    #[serde(default)]
-    gossip_port_base: Option<u16>,
 }
 
 /// What the operator sends back.
@@ -515,6 +513,13 @@ impl Server {
                     continue;
                 }
                 let _ = respond(&mut s, "200 OK", b"{}").await;
+                // The devtunnel host still relays the reply. Deleting the tunnel before it closes
+                // this connection can lose the reply, and the new machine sees a 404.
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut rest = Vec::new();
+                    let _ = s.read_to_end(&mut rest).await;
+                })
+                .await;
                 return serde_json::from_slice(&req.body).context("bad report from the new machine");
             },
             (Server::Iroh(_), Peer::Http(_)) => unreachable!("an iroh server has iroh peers"),
@@ -613,13 +618,6 @@ fn confirm() -> Result<bool> {
 async fn admit(admitter: &Admitter, addr: &iroh::EndpointAddr, name: &str, hello: &Hello) -> Result<Answer> {
     let client = admitter.client();
     let entry: Inspect = client.call(None, "machine.inspect", ()).await?;
-    if let Some(base) = hello.gossip_port_base {
-        let theirs = entry.gossip_port_base;
-        ensure!(
-            base == theirs,
-            "the new machine uses gossip ports from {base}, the cluster from {theirs}; run `imesh up --gossip-port-base {theirs}` there"
-        );
-    }
     ensure!(
         hello.tunnel.is_some() || !entry.devtunnel_mesh,
         "the cluster uses the devtunnel mesh; run `imesh up --relay devtunnel` on the new machine first"
@@ -640,7 +638,7 @@ pub async fn join(code: &Code, force: bool) -> Result<bool> {
     let mut c = crate::connect::open(&Connection::local()).await.context("no imesh daemon here")?;
     let i: Inspect = c.call(None, "machine.inspect", ()).await?;
     if i.cluster.is_some() {
-        let alone = i.alone_and_empty || (force && alone(&c, i.id).await?);
+        let alone = i.alone || (force && alone(&c, i.id).await?);
         if !alone {
             c.close().await;
             bail!(if force {
@@ -652,15 +650,15 @@ pub async fn join(code: &Code, force: bool) -> Result<bool> {
                 )
             });
         }
-        if i.alone_and_empty {
+        if i.alone {
             eprintln!("leaving this machine's own empty cluster to join; the machine gets a new key");
         } else {
             eprintln!(
-                "--force: leaving this machine's own cluster {} to join; its kv and app data are deleted, and the machine gets a new key",
+                "--force: leaving this machine's own cluster {} to join; the machine gets a new key and its other members lose it",
                 i.cluster.as_deref().unwrap_or_default()
             );
         }
-        c.call::<Value>(None, "machine.reset", ()).await?;
+        c.call::<Value>(None, "machine.reset", json!({ "if_alone": i.alone })).await?;
         c.close().await;
         c = reconnect_after_reset(i.id).await?;
     }
@@ -700,7 +698,6 @@ async fn join_with(c: &Client, code: &Code) -> Result<()> {
         os: i.info.os.clone(),
         arch: i.info.arch.clone(),
         tunnel,
-        gossip_port_base: Some(i.gossip_port_base),
     };
     let mut channel = Channel::open(code, &i).await?;
     eprintln!(
@@ -731,8 +728,17 @@ async fn join_with(c: &Client, code: &Code) -> Result<()> {
         Ok((cluster, _)) => Done { cluster: Some(cluster.clone()), error: None },
         Err(e) => Done { cluster: None, error: Some(format!("{e:#}")) },
     };
-    channel.call("done", &report).await?;
+    let reported = channel.call("done", &report).await;
     channel.close().await;
+    match reported {
+        // The machine is in the cluster: only the report to the inviting computer was lost.
+        Err(e) if result.is_ok() => {
+            eprintln!("warning: could not tell the inviting computer that this machine joined: {e:#}")
+        }
+        r => {
+            r?;
+        }
+    }
     println!("{}", result?.1);
     Ok(())
 }
