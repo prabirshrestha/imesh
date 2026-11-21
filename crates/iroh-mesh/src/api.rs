@@ -10,6 +10,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::bytes::Bytes;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 pub const API_ALPN: &[u8] = b"imesh/api/1";
@@ -46,7 +47,7 @@ pub enum Reply {
 }
 
 pub async fn send<T: Serialize>(s: &mut Stream, v: &T) -> Result<()> {
-    s.send(serde_json::to_vec(v)?.into()).await?;
+    s.send(Bytes::from(serde_json::to_vec(v)?)).await?;
     Ok(())
 }
 

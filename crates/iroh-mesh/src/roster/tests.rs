@@ -1,7 +1,7 @@
 use super::*;
 use rand::rngs::StdRng;
 use rand::seq::{IndexedRandom, SliceRandom};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn key() -> SecretKey {
     SecretKey::generate()

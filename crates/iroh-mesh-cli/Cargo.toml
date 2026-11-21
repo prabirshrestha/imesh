@@ -17,31 +17,31 @@ path = "src/main.rs"
 iroh-mesh = { path = "../iroh-mesh", version = "0.0.5" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-data-encoding = "2"
+data-encoding = "2.11.1"
 dirs = "7.0.0"
 hex = "0.4.3"
-iroh = "1.2"
-iroh-tickets = "1"
+iroh = "1.4.1"
+iroh-tickets = "1.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-tokio = { version = "1.53.1", features = ["full"] }
-toml = "1.1.6"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
-tar = "0.4"
-jaq-core = "3.1"
-jaq-std = "3.0.1"
-jaq-json = "2.0.2"
-russh = { version = "0.64.1", default-features = false, features = ["ring", "flate2"] }
+tar = "0.4.46"
+jaq-core = "3.1.2"
+jaq-std = "3.0.4"
+jaq-json = "2.0.3"
+russh = { version = "0.65.1", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "3.0.1"
 portable-pty = "0.9.0"
-terminal_size = "0.4"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+terminal_size = "0.4.4"
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [target."cfg(windows)".dependencies]
-windows-service = "0.8"
+windows-service = "0.8.1"
