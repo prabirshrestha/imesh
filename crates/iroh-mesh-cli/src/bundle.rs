@@ -174,7 +174,7 @@ fn check_entries(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, m: &Mani
     let mut seen = BTreeSet::new();
     for i in 0..archive.len() {
         let f = archive.by_index(i)?;
-        let name = f.name().to_string();
+        let name = f.name()?.into_owned();
         if f.is_dir() {
             ensure!(m.targets.iter().any(|a| a.path.starts_with(&name)) || name == "targets/", "unexpected {name:?}");
             continue;
@@ -218,7 +218,7 @@ pub fn extract(bytes: &[u8], dest: &Path) -> Result<Manifest> {
         std::fs::create_dir_all(out.parent().expect("has a parent"))?;
         let mut data = Vec::new();
         f.read_to_end(&mut data)?;
-        write_file(&out, &data, f.name() != MANIFEST)?;
+        write_file(&out, &data, f.name()? != MANIFEST)?;
     }
     verify_dir(dest, &m)?;
     Ok(m)
