@@ -24,6 +24,7 @@ const triples = {
   "linux-arm64": "aarch64-unknown-linux-musl",
   "linux-x64": "x86_64-unknown-linux-musl",
   "windows-x64": "x86_64-pc-windows-gnu",
+  "windows-arm64": "aarch64-pc-windows-msvc",
 };
 
 const common = { version, license: main.license, repository: main.repository };

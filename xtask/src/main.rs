@@ -111,8 +111,13 @@ fn script(root: &Path, path: &str, vars: &[String]) -> Result<(), String> {
 }
 
 /// The targets of a full bundle. The host's own triple is added when it is not one of them.
-const TARGETS: &[&str] =
-    &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc-windows-gnu", "aarch64-apple-darwin"];
+const TARGETS: &[&str] = &[
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-gnu",
+    "aarch64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+];
 
 fn exe(triple: &str) -> &'static str {
     if triple.contains("windows") { "imesh.exe" } else { "imesh" }
@@ -169,6 +174,12 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         if t.contains("windows-gnu") && !has("x86_64-w64-mingw32-gcc", "--version") {
             missing.push(format!("{t} needs MinGW (x86_64-w64-mingw32-gcc)"));
         }
+        if t.contains("windows-msvc") && !has("cargo-xwin", "--version") {
+            missing.push(format!("{t} needs cargo-xwin: cargo install --locked cargo-xwin"));
+        }
+        if t.contains("windows-msvc") && !has("llvm-lib", "/?") && !has("llvm-ar", "--version") {
+            missing.push(format!("{t} needs LLVM (clang and llvm-lib) on the PATH: brew install llvm"));
+        }
         if t.contains("apple-darwin") && *t != host && !host.contains("apple-darwin") {
             missing.push(format!("{t} needs a Mac build host or an Apple SDK; build on a Mac"));
         }
@@ -207,8 +218,17 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         println!("building {t}");
         let mut args = vec!["--release", "--target", t.as_str()];
         args.extend(&what);
-        let sub = if t.contains("linux-musl") { "zigbuild" } else { "build" };
-        let mut all = vec![sub];
+        // cargo-xwin fetches Microsoft's C runtime and Windows SDK libraries, so that a Mac can
+        // link the MSVC target.
+        let sub: &[&str] = if t.contains("linux-musl") {
+            &["zigbuild"]
+        } else if t.contains("windows-msvc") {
+            // `clang` mode, because cc-rs hands clang-cl style flags to plain clang otherwise.
+            &["xwin", "build", "--cross-compiler", "clang"]
+        } else {
+            &["build"]
+        };
+        let mut all: Vec<&str> = sub.to_vec();
         all.extend(args);
         let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         cmd.current_dir(root).args(&all);
@@ -268,6 +288,7 @@ fn npm_install(root: &Path) -> Result<(), String> {
         "x86_64-unknown-linux-musl" | "x86_64-unknown-linux-gnu" => "linux-x64",
         "aarch64-unknown-linux-musl" | "aarch64-unknown-linux-gnu" => "linux-arm64",
         "x86_64-pc-windows-gnu" | "x86_64-pc-windows-msvc" => "windows-x64",
+        "aarch64-pc-windows-msvc" => "windows-arm64",
         other => return Err(format!("no npm package for {other}")),
     };
     let toml = std::fs::read_to_string(root.join("crates/iroh-mesh-cli/Cargo.toml")).map_err(|e| e.to_string())?;
@@ -317,7 +338,7 @@ fn install_prerequisites(root: &Path) -> Result<(), String> {
     let host = host_triple()?;
     if host.contains("apple-darwin") {
         if !has("brew", "--version") { return Err("install Homebrew from https://brew.sh, then run cargo x tools".into()); }
-        run(Command::new("brew").args(["install", "zig", "mingw-w64"]))?;
+        run(Command::new("brew").args(["install", "zig", "mingw-w64", "llvm"]))?;
     } else if host.contains("linux") {
         return Err("install Zig, MinGW-w64, and an Apple SDK/build host; Rust tools are ready".into());
     } else {
@@ -325,6 +346,9 @@ fn install_prerequisites(root: &Path) -> Result<(), String> {
     }
     for (cmd, arg) in [("zig", "version"), ("cargo-zigbuild", "--version"), ("x86_64-w64-mingw32-gcc", "--version")] {
         if !has(cmd, arg) { return Err(format!("required tool is missing: {cmd}")); }
+    }
+    if !has("cargo-xwin", "--version") {
+        return Err("the Windows arm64 build needs cargo-xwin: cargo install --locked cargo-xwin".into());
     }
     println!("Build tools are ready. Run cargo x build.");
     Ok(())

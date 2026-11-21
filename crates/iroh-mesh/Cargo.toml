@@ -36,3 +36,8 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [dev-dependencies]
 rand = "0.10.3"
+
+# blake3 builds C code for NEON, and the MSVC headers that cargo-xwin links against conflict with
+# clang's vector types. The pure Rust version is as fast as the roster needs.
+[target.'cfg(all(windows, target_arch = "aarch64"))'.dependencies]
+blake3 = { version = "1.8.7", features = ["pure"] }
