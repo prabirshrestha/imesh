@@ -177,6 +177,9 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         if t.contains("windows-msvc") && !has("cargo-xwin", "--version") {
             missing.push(format!("{t} needs cargo-xwin: cargo install --locked cargo-xwin"));
         }
+        if t.contains("windows-msvc") && !has("llvm-lib", "/?") && !has("llvm-ar", "--version") {
+            missing.push(format!("{t} needs LLVM (clang and llvm-lib) on the PATH: brew install llvm"));
+        }
         if t.contains("apple-darwin") && *t != host && !host.contains("apple-darwin") {
             missing.push(format!("{t} needs a Mac build host or an Apple SDK; build on a Mac"));
         }
@@ -335,7 +338,7 @@ fn install_prerequisites(root: &Path) -> Result<(), String> {
     let host = host_triple()?;
     if host.contains("apple-darwin") {
         if !has("brew", "--version") { return Err("install Homebrew from https://brew.sh, then run cargo x tools".into()); }
-        run(Command::new("brew").args(["install", "zig", "mingw-w64"]))?;
+        run(Command::new("brew").args(["install", "zig", "mingw-w64", "llvm"]))?;
     } else if host.contains("linux") {
         return Err("install Zig, MinGW-w64, and an Apple SDK/build host; Rust tools are ready".into());
     } else {

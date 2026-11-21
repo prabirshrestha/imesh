@@ -233,7 +233,7 @@ cargo x install
 `npm install -g`, the same as the published package. Then `imesh` is on your PATH.
 
 `cargo x tools` installs the build tools on macOS: Zig, cargo-zigbuild, and MinGW-w64. The
-Windows arm64 build also needs [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (`cargo install --locked cargo-xwin`). It downloads Microsoft's C runtime and Windows SDK libraries on first use, about 1 GB.
+Windows arm64 build also needs LLVM on your PATH (`brew install llvm`, then add `$(brew --prefix llvm)/bin`) and [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (`cargo install --locked cargo-xwin`). It downloads Microsoft's C runtime and Windows SDK libraries on first use, about 1 GB.
 Run `imesh --help` for every command.
 
 ## License

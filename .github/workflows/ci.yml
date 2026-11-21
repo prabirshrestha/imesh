@@ -40,6 +40,10 @@ jobs:
           crate=$(grep -m 1 '^version = ' crates/iroh-mesh-cli/Cargo.toml | cut -d '"' -f 2)
           [ "${GITHUB_REF_NAME#v}" = "$crate" ] || { echo "tag $GITHUB_REF_NAME does not match iroh-mesh-cli $crate"; exit 1; }
       - run: brew install cargo-zigbuild
+      - name: Put LLVM on the PATH, because the Windows arm64 build needs clang and llvm-lib
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
       - name: Install cargo-xwin, which links the Windows arm64 target
         run: cargo install --locked cargo-xwin --version 0.23.1
       - name: Cache the Windows SDK that cargo-xwin fetches
