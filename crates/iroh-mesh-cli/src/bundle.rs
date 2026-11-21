@@ -50,8 +50,8 @@ pub fn triple(os: &str, arch: &str) -> Result<&'static str> {
     Ok(match (os.as_str(), arch.as_str()) {
         ("linux", "x86_64" | "amd64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64" | "arm64") => "aarch64-unknown-linux-musl",
-        // Windows on ARM64 runs the x86-64 build under emulation.
-        ("windows", "x86_64" | "amd64" | "aarch64" | "arm64") => "x86_64-pc-windows-gnu",
+        ("windows", "x86_64" | "amd64") => "x86_64-pc-windows-gnu",
+        ("windows", "aarch64" | "arm64") => "aarch64-pc-windows-msvc",
         ("macos" | "darwin", "aarch64" | "arm64") => "aarch64-apple-darwin",
         _ => bail!("no imesh build for {os}/{arch}"),
     })
@@ -407,7 +407,8 @@ mod tests {
     fn triples() {
         assert_eq!(triple("Linux", "x86_64").unwrap(), "x86_64-unknown-linux-musl");
         assert_eq!(triple("linux", "aarch64").unwrap(), "aarch64-unknown-linux-musl");
-        assert_eq!(triple("windows", "ARM64").unwrap(), "x86_64-pc-windows-gnu");
+        assert_eq!(triple("windows", "AMD64").unwrap(), "x86_64-pc-windows-gnu");
+        assert_eq!(triple("windows", "ARM64").unwrap(), "aarch64-pc-windows-msvc");
         assert_eq!(triple("Darwin", "arm64").unwrap(), "aarch64-apple-darwin");
         assert!(triple("linux", "riscv64").is_err());
     }

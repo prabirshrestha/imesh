@@ -26,7 +26,7 @@ jobs:
       - run: cargo x test
 
   # One bundle with every target. The Darwin target needs a Mac, and the Mac cross-builds the
-  # Linux (zig) and Windows (MinGW) targets.
+  # Linux (zig) and Windows (MinGW for x64, cargo-xwin for arm64) targets.
   bundle:
     needs: check
     runs-on: macos-latest
@@ -40,6 +40,13 @@ jobs:
           crate=$(grep -m 1 '^version = ' crates/iroh-mesh-cli/Cargo.toml | cut -d '"' -f 2)
           [ "${GITHUB_REF_NAME#v}" = "$crate" ] || { echo "tag $GITHUB_REF_NAME does not match iroh-mesh-cli $crate"; exit 1; }
       - run: brew install cargo-zigbuild
+      - name: Install cargo-xwin, which links the Windows arm64 target
+        run: cargo install --locked cargo-xwin --version 0.23.1
+      - name: Cache the Windows SDK that cargo-xwin fetches
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
       - run: cargo x tools
       - run: cargo x build
       - name: Check the npm size limit
