@@ -6,6 +6,7 @@ mod links;
 mod machine;
 mod mesh;
 pub(crate) mod methods;
+mod wake;
 
 use std::{
     collections::BTreeMap,
@@ -138,8 +139,9 @@ impl Builder {
         let config = self.config;
         config.net.validate()?;
         let devtunnel_cli = config.net.devtunnel_cli.clone();
+        let wake = tokio::sync::watch::channel(0u64).0;
         let forwarding = match &config.net.devtunnel {
-            Some(tunnel) => Some(tunnel.start(config.net.devtunnel_cli.clone()).await?),
+            Some(tunnel) => Some(tunnel.start(config.net.devtunnel_cli.clone(), wake.subscribe()).await?),
             None => None,
         };
         crate::os::create_private_dir(&config.data_dir)?;
@@ -165,7 +167,8 @@ impl Builder {
             hellos: Default::default(),
             answering: Default::default(),
             exposed: tokio::sync::watch::channel(None).0,
-            mesh: mesh::Mesh::new(devtunnel_cli),
+            mesh: mesh::Mesh::new(devtunnel_cli, wake.subscribe()),
+            wake,
             relays: tokio::sync::Mutex::new(initial.clone()),
             joining: Default::default(),
             reset: tokio::sync::watch::channel(false).0,
@@ -183,6 +186,7 @@ impl Builder {
         let mut tasks = vec![
             AbortOnDropHandle::new(tokio::spawn(machine.clone().background())),
             AbortOnDropHandle::new(tokio::spawn(machine.clone().sync_loop())),
+            AbortOnDropHandle::new(tokio::spawn(machine.clone().watch_wake())),
         ];
         tasks.extend(tunnel);
         tasks.extend(forwarding);

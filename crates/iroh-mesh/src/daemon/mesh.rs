@@ -3,7 +3,8 @@
 //! when that is in use here, so each machine names a member's relay by its own forward.
 //!
 //! Each forward has one owner, a task that holds the `devtunnel connect` child and starts it
-//! again when it stops. A forward is ready only while its child runs. The tasks hold no
+//! again when it stops. A forward is ready only while its child runs and the member's relay
+//! answers through it. A wake from sleep or a network change checks every forward at once. The tasks hold no
 //! [`super::Machine`], so dropping the mesh stops every child.
 
 use std::{
@@ -33,11 +34,13 @@ pub(crate) struct Mesh {
     changed: watch::Sender<u64>,
     /// The devtunnel CLI, else `devtunnel` from the PATH.
     cli: Option<std::path::PathBuf>,
+    /// Wakes from sleep and network changes: each forward checks its member's relay at once.
+    wake: net::devtunnel::Wake,
 }
 
 impl Mesh {
-    pub fn new(cli: Option<std::path::PathBuf>) -> Self {
-        Mesh { forwards: Default::default(), changed: Default::default(), cli }
+    pub fn new(cli: Option<std::path::PathBuf>, wake: net::devtunnel::Wake) -> Self {
+        Mesh { forwards: Default::default(), changed: Default::default(), cli, wake }
     }
 
     /// Fires when a forward becomes ready or stops.
@@ -121,6 +124,7 @@ impl Mesh {
         };
         info!(member = %id.fmt_short(), endpoint = ?endpoint, pinned, "mesh relay: starting forward");
         let cli = self.cli.clone();
+        let mut wake = self.wake.clone();
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -129,7 +133,8 @@ impl Mesh {
                         info!(member = %id.fmt_short(), tunnel = %connect.id, port, local, "mesh relay forwarded");
                         set(Some(local));
                         backoff = Duration::from_secs(1);
-                        let why = connect.watch(&mut child, local).await.unwrap_or_else(|e| format!("{e:#}"));
+                        let why =
+                            connect.watch(&mut child, local, &mut wake).await.unwrap_or_else(|e| format!("{e:#}"));
                         set(None);
                         warn!(member = %id.fmt_short(), "mesh relay forward stopped ({why}); starting it again");
                     }
@@ -138,8 +143,7 @@ impl Mesh {
                         warn!(member = %id.fmt_short(), "mesh relay: {e:#}");
                     }
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff = net::devtunnel::nap(backoff, &mut wake).await;
             }
         });
         Forward { endpoint, ready, pinned, _task: AbortOnDropHandle::new(task) }

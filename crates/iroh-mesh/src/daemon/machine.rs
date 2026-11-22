@@ -76,6 +76,8 @@ pub struct Inner {
     pub(crate) exposed: tokio::sync::watch::Sender<Option<net::devtunnel::Hosted>>,
     /// The forwards of other members' tunnels.
     pub(crate) mesh: super::mesh::Mesh,
+    /// Counts wakes from sleep and network changes (see `wake.rs`).
+    pub(crate) wake: tokio::sync::watch::Sender<u64>,
 
     // Lifecycle.
     /// Set by `machine.reset`. [`Running::reset_requested`] waits for it.
@@ -252,6 +254,7 @@ impl Machine {
                 self.name().to_string(),
                 r.devtunnel_cli.clone(),
                 self.exposed.clone(),
+                self.wake.subscribe(),
             )
         });
         Ok((Some(server), tunnel))

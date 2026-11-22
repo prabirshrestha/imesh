@@ -61,12 +61,13 @@ pub(crate) fn expose(
     name: String,
     cli: Option<PathBuf>,
     url: watch::Sender<Option<Hosted>>,
+    mut wake: Wake,
 ) -> AbortOnDropHandle<()> {
     match how {
         Expose::DevTunnel { id } => AbortOnDropHandle::new(tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match devtunnel(cli.as_deref(), id.as_deref(), port, machine, &name, &url).await {
+                match devtunnel(cli.as_deref(), id.as_deref(), port, machine, &name, &url, &mut wake).await {
                     Ok(stable) => {
                         if stable {
                             backoff = Duration::from_secs(1);
@@ -75,8 +76,7 @@ pub(crate) fn expose(
                     }
                     Err(e) => warn!("devtunnel: {e:#}"),
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff = nap(backoff, &mut wake).await;
             }
         })),
     }
@@ -130,6 +130,7 @@ async fn devtunnel(
     machine: EndpointId,
     name: &str,
     url: &watch::Sender<Option<Hosted>>,
+    wake: &mut Wake,
 ) -> Result<bool> {
     let label = format!("imesh-{}", machine.fmt_short());
     let tunnel = match id {
@@ -198,7 +199,7 @@ async fn devtunnel(
     info!(%tunnel, %local, "private relay hosted through devtunnel");
     url.send_replace(Some(Hosted { url: local, tunnel: tunnel.clone() }));
     let started = tokio::time::Instant::now();
-    let status = supervise(&mut child, CHECK_EVERY, || hosted(cli, &tunnel)).await;
+    let status = supervise(&mut child, CHECK_EVERY, wake, || hosted(cli, &tunnel)).await;
     url.send_replace(None);
     let status = status?;
     info!(%status, "devtunnel host stopped");
@@ -312,7 +313,7 @@ impl Connect {
     /// Starts the CLI and waits for its forwarding announcement. Dropping the handle
     /// stops only this child. No login credentials or tokens enter imesh's database.
     /// `cli` is the devtunnel CLI, else `devtunnel` from the PATH.
-    pub async fn start(&self, cli: Option<PathBuf>) -> Result<AbortOnDropHandle<()>> {
+    pub async fn start(&self, cli: Option<PathBuf>, mut wake: Wake) -> Result<AbortOnDropHandle<()>> {
         valid_id(&self.id)?;
         ensure!(self.port != 0, "devtunnel port must not be zero");
         let (first, _) = self.connect(cli.as_deref(), true).await?;
@@ -322,15 +323,14 @@ impl Connect {
             let mut backoff = Duration::from_secs(1);
             loop {
                 let started = tokio::time::Instant::now();
-                if let Ok(why) = supervise(&mut child, CHECK_EVERY, || listening(config.port)).await {
+                if let Ok(why) = supervise(&mut child, CHECK_EVERY, &mut wake, || relay_answers(config.port)).await {
                     warn!(tunnel = %config.id, "devtunnel connect stopped: {why}");
                 }
                 if started.elapsed() >= Duration::from_secs(60) {
                     backoff = Duration::from_secs(1);
                 }
                 loop {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    backoff = nap(backoff, &mut wake).await;
                     match config.connect(cli.as_deref(), true).await {
                         Ok((next, _)) => {
                             child = next;
@@ -350,10 +350,10 @@ impl Connect {
         self.connect(cli, false).await
     }
 
-    /// Runs until the forwarding child exits, or stops it when its local `port` stops accepting
-    /// connections. Returns why it stopped.
-    pub(crate) async fn watch(&self, child: &mut tokio::process::Child, port: u16) -> Result<String> {
-        supervise(child, CHECK_EVERY, || listening(port)).await
+    /// Runs until the forwarding child exits, or stops it when the member's relay stops answering
+    /// through its local `port`. Returns why it stopped.
+    pub(crate) async fn watch(&self, child: &mut tokio::process::Child, port: u16, wake: &mut Wake) -> Result<String> {
+        supervise(child, CHECK_EVERY, wake, || relay_answers(port)).await
     }
 
     /// With `exact`, the local port must be the tunnel's port, because every member names the
@@ -404,28 +404,55 @@ enum Check {
     Unknown(String),
 }
 
+/// Fires when the computer woke from sleep or its network changed (see `daemon::wake`): the
+/// devtunnel children are checked at once then, and a child that waits to start again starts now.
+pub type Wake = watch::Receiver<u64>;
+
+/// Resolves on the next wake. Never, when no one sends wakes any more.
+async fn woken(wake: &mut Wake) {
+    if wake.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Sleeps `backoff`, or less when a wake comes. Gives the next backoff: doubled up to a minute,
+/// or one second again after a wake.
+pub(crate) async fn nap(backoff: Duration, wake: &mut Wake) -> Duration {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => (backoff * 2).min(Duration::from_secs(60)),
+        _ = woken(wake) => Duration::from_secs(1),
+    }
+}
+
 /// Waits for `child` to exit. A devtunnel child can stay running after it loses its connection to
 /// the service, and then nothing restarts it. So `check` runs every `every`, and after
-/// [`CHECK_FAILURES`] `Down` results in a row the child is stopped. The caller then starts a new
-/// one.
-async fn supervise<F, Fut>(child: &mut tokio::process::Child, every: Duration, check: F) -> Result<String>
+/// [`CHECK_FAILURES`] `Down` results in a row the child is stopped. A wake runs `check` at once,
+/// and one `Down` then stops the child: after sleep or a network change, its connection is most
+/// likely gone. The caller then starts a new one.
+async fn supervise<F, Fut>(
+    child: &mut tokio::process::Child,
+    every: Duration,
+    wake: &mut Wake,
+    check: F,
+) -> Result<String>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Check>,
 {
     let mut failures = 0;
     loop {
-        let result = tokio::select! {
+        let (result, woke) = tokio::select! {
             status = child.wait() => return Ok(format!("exited: {}", status?)),
-            result = async { tokio::time::sleep(every).await; check().await } => result,
+            result = async { tokio::time::sleep(every).await; check().await } => (result, false),
+            result = async { woken(wake).await; check().await } => (result, true),
         };
         match result {
             Check::Alive => failures = 0,
             Check::Unknown(e) => tracing::debug!("devtunnel check could not run: {e}"),
             Check::Down(e) => {
                 failures += 1;
-                warn!(failures, "devtunnel check failed: {e}");
-                if failures >= CHECK_FAILURES {
+                warn!(failures, woke, "devtunnel check failed: {e}");
+                if woke || failures >= CHECK_FAILURES {
                     let _ = child.kill().await;
                     return Ok(format!("stopped after {failures} failed checks: {e}"));
                 }
@@ -452,14 +479,47 @@ fn host_connections(details: &serde_json::Value, tunnel: &str) -> Check {
     }
 }
 
-/// The forwarded port accepts connections: `devtunnel connect` still listens.
-async fn listening(port: u16) -> Check {
-    let connect = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port));
-    match tokio::time::timeout(Duration::from_secs(5), connect).await {
-        Ok(Ok(_)) => Check::Alive,
-        Ok(Err(e)) => Check::Down(format!("nothing listens on 127.0.0.1:{port}: {e}")),
-        Err(_) => Check::Down(format!("127.0.0.1:{port} did not accept a connection within 5 seconds")),
+/// The member's relay answers through the forward: `GET /healthz` on the forwarded port goes
+/// through `devtunnel connect`, the service and the member's `devtunnel host` to its relay. A
+/// forward can listen and still carry nothing, after sleep or a network change.
+async fn relay_answers(port: u16) -> Check {
+    match tokio::time::timeout(RELAY_CHECK_TIMEOUT, healthz(port)).await {
+        Ok(Ok(200)) => Check::Alive,
+        Ok(Ok(status)) => Check::Down(format!("the relay through 127.0.0.1:{port} answered {status}")),
+        Ok(Err(e)) => Check::Down(format!("no relay answers through 127.0.0.1:{port}: {e:#}")),
+        Err(_) => Check::Down(format!(
+            "the relay through 127.0.0.1:{port} did not answer within {} seconds",
+            RELAY_CHECK_TIMEOUT.as_secs()
+        )),
     }
+}
+
+const RELAY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The status of `GET /healthz` on the loopback `port`.
+async fn healthz(port: u16) -> Result<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    stream
+        .write_all(format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await?;
+    let mut head = Vec::new();
+    let mut buf = [0u8; 256];
+    while !head.windows(2).any(|w| w == b"\r\n") {
+        let n = stream.read(&mut buf).await?;
+        ensure!(n != 0, "the connection closed before an answer");
+        head.extend_from_slice(&buf[..n]);
+        ensure!(head.len() < 4096, "the answer has no status line");
+    }
+    status_of(&head).context("the answer is not HTTP")
+}
+
+/// The status code of an HTTP status line: `HTTP/1.1 200 OK`.
+fn status_of(head: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(head).ok()?.lines().next()?;
+    let mut words = line.split_whitespace();
+    words.next().filter(|v| v.starts_with("HTTP/"))?;
+    words.next()?.parse().ok()
 }
 
 /// Waits until a host is ready, or with `forward` until a forward listens. Returns the forward's
@@ -538,7 +598,8 @@ mod tests {
     async fn host_rejects_invalid_library_id_before_running_cli() {
         let url = watch::channel(None).0;
         let machine = iroh::SecretKey::generate().public();
-        let error = devtunnel(None, Some("--help"), 3340, machine, "m", &url).await.unwrap_err();
+        let error =
+            devtunnel(None, Some("--help"), 3340, machine, "m", &url, &mut watch::channel(0).1).await.unwrap_err();
         assert_eq!(error.to_string(), "invalid devtunnel ID");
         assert!(url.borrow().is_none());
     }
@@ -564,22 +625,83 @@ mod tests {
                 .expect("run the test binary")
         };
         let every = Duration::from_millis(10);
+        let (_tx, wake) = watch::channel(0);
         let mut stuck = spawn();
-        let why = supervise(&mut stuck, every, || async { Check::Down("down".into()) }).await.unwrap();
+        let why =
+            supervise(&mut stuck, every, &mut wake.clone(), || async { Check::Down("down".into()) }).await.unwrap();
         assert!(why.starts_with("stopped after 3 failed checks"), "{why}");
         assert!(stuck.try_wait().unwrap().is_some(), "the stuck child was stopped");
 
         let mut healthy = spawn();
-        let kept =
-            tokio::time::timeout(Duration::from_millis(200), supervise(&mut healthy, every, || async { Check::Alive }));
+        let mut w = wake.clone();
+        let kept = tokio::time::timeout(
+            Duration::from_millis(200),
+            supervise(&mut healthy, every, &mut w, || async { Check::Alive }),
+        );
         assert!(kept.await.is_err(), "a child that passes its checks keeps running");
 
         let mut unknown = spawn();
-        let kept = supervise(&mut unknown, every, || async { Check::Unknown("slow".into()) });
+        let mut w = wake.clone();
+        let kept = supervise(&mut unknown, every, &mut w, || async { Check::Unknown("slow".into()) });
         assert!(
             tokio::time::timeout(Duration::from_millis(200), kept).await.is_err(),
             "a check that cannot run does not stop the child"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_checks_at_once_and_one_failure_then_stops_the_child() {
+        let spawn = || {
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "net::devtunnel::tests::sleep_as_child", "--ignored"])
+                .env("IMESH_TEST_CHILD", "1")
+                .stdout(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("run the test binary")
+        };
+        let (tx, mut wake) = watch::channel(0);
+        let mut child = spawn();
+        // Checks are an hour apart, so only the wake can run one.
+        let run = supervise(&mut child, Duration::from_secs(3600), &mut wake, || async { Check::Down("gone".into()) });
+        let started = tokio::time::Instant::now();
+        let (why, ()) = tokio::join!(run, async { tx.send_modify(|n| *n += 1) });
+        assert!(why.unwrap().starts_with("stopped after 1 failed checks"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some());
+
+        // A wake cuts the wait before a new start short, and the backoff starts again.
+        let (tx, mut wake) = watch::channel(0);
+        let napping = nap(Duration::from_secs(3600), &mut wake);
+        let (next, ()) = tokio::join!(napping, async { tx.send_modify(|n| *n += 1) });
+        assert_eq!(next, Duration::from_secs(1));
+        let (_tx, mut quiet) = watch::channel(0);
+        assert_eq!(nap(Duration::from_millis(5), &mut quiet).await, Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn the_relay_check_reads_the_status_through_the_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serve = |status: &'static str| {
+            let listener = &listener;
+            async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let n = s.read(&mut buf).await.unwrap();
+                assert!(buf[..n].starts_with(b"GET /healthz HTTP/1.1"));
+                s.write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        };
+        let (check, ()) = tokio::join!(relay_answers(port), serve("200 OK"));
+        assert!(matches!(check, Check::Alive));
+        let (check, ()) = tokio::join!(relay_answers(port), serve("502 Bad Gateway"));
+        assert!(matches!(check, Check::Down(e) if e.contains("502")));
+        drop(listener);
+        assert!(matches!(relay_answers(port).await, Check::Down(_)));
+        assert_eq!(status_of(b"HTTP/1.1 204 No Content\r\n"), Some(204));
+        assert_eq!(status_of(b"SSH-2.0-x\r\n"), None);
     }
 
     #[test]
