@@ -85,11 +85,13 @@ pub(crate) fn expose(
 /// The devtunnel CLI: `cli`, else `devtunnel` from the PATH.
 pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     // A saved path goes stale when the CLI moves, for example after an upgrade.
-    let mut c = tokio::process::Command::new(cli.filter(|p| p.exists()).unwrap_or(Path::new("devtunnel")));
+    // A relative path is from our folder, not the home the CLI runs in.
+    let cli = cli.filter(|p| p.exists()).map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()));
+    let mut c = tokio::process::Command::new(cli.as_deref().unwrap_or(Path::new("devtunnel")));
     // The CLI keeps its login under the user's data folder, and where that folder does not exist
     // (no ~/.local/share on Linux) it uses ./DevTunnels instead. So run it from the home folder:
     // from another folder it does not find the login and says "Login required".
-    if let Some(home) = std::env::home_dir() {
+    if let Some(home) = std::env::home_dir().filter(|h| h.is_dir()) {
         c.current_dir(home);
     }
     c
