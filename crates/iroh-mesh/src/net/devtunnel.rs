@@ -94,6 +94,10 @@ pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     if let Some(home) = std::env::home_dir().filter(|h| h.is_dir()) {
         c.current_dir(home);
     }
+    // CREATE_NO_WINDOW: a process with no console (an app, a detached node) would otherwise get a new, visible
+    // console window for each call, flashing on screen.
+    #[cfg(windows)]
+    c.creation_flags(0x0800_0000);
     c
 }
 
