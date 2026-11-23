@@ -94,6 +94,11 @@ pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     if let Some(home) = std::env::home_dir().filter(|h| h.is_dir()) {
         c.current_dir(home);
     }
+    // On Windows, a console program started by a process with no console (a node started by a
+    // scheduled task, a service or the app) opens its own console window, and `devtunnel host`
+    // keeps it open for as long as it runs. CREATE_NO_WINDOW starts it without one.
+    #[cfg(windows)]
+    c.creation_flags(0x0800_0000);
     c
 }
 
