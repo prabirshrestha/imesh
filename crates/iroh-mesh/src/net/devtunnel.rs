@@ -85,7 +85,14 @@ pub(crate) fn expose(
 /// The devtunnel CLI: `cli`, else `devtunnel` from the PATH.
 pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     // A saved path goes stale when the CLI moves, for example after an upgrade.
-    tokio::process::Command::new(cli.filter(|p| p.exists()).unwrap_or(Path::new("devtunnel")))
+    let mut c = tokio::process::Command::new(cli.filter(|p| p.exists()).unwrap_or(Path::new("devtunnel")));
+    // The CLI keeps its login under the user's data folder, and where that folder does not exist
+    // (no ~/.local/share on Linux) it uses ./DevTunnels instead. So run it from the home folder:
+    // from another folder it does not find the login and says "Login required".
+    if let Some(home) = std::env::home_dir() {
+        c.current_dir(home);
+    }
+    c
 }
 
 /// The environment variable that marks a long-running devtunnel child (`host`, `connect`) with
