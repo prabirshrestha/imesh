@@ -12,7 +12,7 @@ use n0_future::task::AbortOnDropHandle;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How a machine publishes the relay it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +294,74 @@ async fn devtunnel(
     let status = status?;
     info!(%status, "devtunnel host stopped");
     Ok(started.elapsed() >= Duration::from_secs(60))
+}
+
+/// The mesh tunnels of this devtunnel login that a host serves now, other than `mine`: by the
+/// short machine ID of each one's `imesh-<id>` label, each with its relay port. A tunnel with no
+/// host, with a port count other than one, or with anonymous access is left out. `ports` keeps the
+/// port of each tunnel seen, so only a new tunnel costs a `devtunnel show`.
+pub(crate) async fn list_hosted(
+    cli: Option<&Path>,
+    mine: &str,
+    ports: &mut std::collections::BTreeMap<String, u16>,
+) -> Result<Vec<(String, crate::state::TunnelEndpoint)>> {
+    #[derive(Deserialize)]
+    struct List {
+        #[serde(default)]
+        tunnels: Vec<Listed>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Listed {
+        tunnel_id: String,
+        #[serde(default)]
+        host_connections: u64,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        port_count: u64,
+    }
+    let list: List = serde_json::from_value(json_of(&dt(cli, &["list", "--labels", "imesh", "-j"]).await?)?)?;
+    let seen: std::collections::BTreeSet<&str> = list.tunnels.iter().map(|t| t.tunnel_id.as_str()).collect();
+    ports.retain(|id, _| seen.contains(id.as_str()));
+    let mut out = Vec::new();
+    for t in &list.tunnels {
+        let Some(short) = machine_label(&t.labels) else { continue };
+        if short == mine || t.host_connections == 0 || t.port_count != 1 || valid_id(&t.tunnel_id).is_err() {
+            continue;
+        }
+        let port = match ports.get(&t.tunnel_id) {
+            Some(p) => *p,
+            None => {
+                let details = match dt(cli, &["show", &t.tunnel_id, "-j"]).await.and_then(|o| json_of(&o)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        debug!(tunnel = %t.tunnel_id, "devtunnel show: {e:#}");
+                        continue;
+                    }
+                };
+                let one = details.pointer("/tunnel/ports").and_then(|p| p.as_array()).filter(|p| p.len() == 1);
+                let Some(p) = one.and_then(|p| p[0]["portNumber"].as_u64()).and_then(|p| u16::try_from(p).ok()) else {
+                    continue;
+                };
+                if anonymous(&details) || p == 0 {
+                    continue;
+                }
+                ports.insert(t.tunnel_id.clone(), p);
+                p
+            }
+        };
+        out.push((short.to_string(), crate::state::TunnelEndpoint::Devtunnel { id: t.tunnel_id.clone(), port }));
+    }
+    Ok(out)
+}
+
+/// The short machine ID of a mesh tunnel's `imesh-<id>` label: 10 lowercase hex characters.
+fn machine_label(labels: &[String]) -> Option<&str> {
+    labels
+        .iter()
+        .filter_map(|l| l.strip_prefix("imesh-"))
+        .find(|id| id.len() == 10 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
 }
 
 /// Deletes the tunnel that a machine hosted, after it left its cluster and its daemon stopped.
@@ -819,6 +887,15 @@ mod tests {
         assert!(matches!(relay_answers(port).await, Check::Down(_)));
         assert_eq!(status_of(b"HTTP/1.1 204 No Content\r\n"), Some(204));
         assert_eq!(status_of(b"SSH-2.0-x\r\n"), None);
+    }
+
+    #[test]
+    fn a_mesh_tunnel_names_its_machine_by_label() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(machine_label(&l(&["imesh", "imesh-26c8e8a90c"])), Some("26c8e8a90c"));
+        assert_eq!(machine_label(&l(&["imesh", "imesh-win"])), None);
+        assert_eq!(machine_label(&l(&["imesh-26C8E8A90C"])), None);
+        assert_eq!(machine_label(&l(&["imesh"])), None);
     }
 
     #[test]

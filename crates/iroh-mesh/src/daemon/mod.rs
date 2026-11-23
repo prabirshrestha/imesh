@@ -191,6 +191,9 @@ impl Builder {
             AbortOnDropHandle::new(tokio::spawn(machine.clone().sync_loop())),
             AbortOnDropHandle::new(tokio::spawn(machine.clone().watch_wake())),
         ];
+        if machine.config.net.devtunnel_mesh {
+            tasks.push(AbortOnDropHandle::new(tokio::spawn(machine.clone().list_tunnels())));
+        }
         tasks.extend(tunnel);
         tasks.extend(forwarding);
         info!(id = %machine.id(), name = %machine.name, "machine started");
