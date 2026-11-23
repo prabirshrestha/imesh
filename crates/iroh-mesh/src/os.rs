@@ -47,6 +47,13 @@ pub fn sd_notify_ready() {
     crate::platform::sd_notify_ready()
 }
 
+/// Time that passed while the computer was awake, from a fixed point: it stops while the computer
+/// sleeps. Rust's `Instant` does that on macOS and Linux, but may count sleep on Windows, where
+/// this reads the unbiased interrupt time instead.
+pub(crate) fn awake_time() -> std::time::Duration {
+    crate::platform::awake_time()
+}
+
 /// Makes a child that `c` starts end when this process ends, where the system can: on Linux by
 /// `PR_SET_PDEATHSIG`. Nothing elsewhere (see [`adopt_child`] for Windows).
 pub(crate) fn end_with_parent(c: &mut tokio::process::Command) {

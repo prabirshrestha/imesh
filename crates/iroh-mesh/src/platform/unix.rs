@@ -174,3 +174,10 @@ pub fn end_with_parent(c: &mut tokio::process::Command) {
 }
 
 pub fn adopt_child(_: &tokio::process::Child) {}
+
+/// From the first call. `Instant` stops while the computer sleeps here: `CLOCK_UPTIME_RAW` on
+/// macOS, `CLOCK_MONOTONIC` on Linux.
+pub fn awake_time() -> std::time::Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}

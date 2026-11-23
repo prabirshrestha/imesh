@@ -3,11 +3,11 @@
 //! look at its network again, and makes every devtunnel child check its tunnel at once (see
 //! `net::devtunnel::supervise`), instead of at its next check.
 //!
-//! Sleep shows as a jump of the wall clock against the monotonic clock, which stops while the
-//! computer sleeps on macOS and Linux. A network change shows as a change of the endpoint's own
+//! Sleep shows as a jump of the wall clock against a clock that stops while the computer sleeps
+//! ([`crate::os::awake_time`]). A network change shows as a change of the endpoint's own
 //! addresses, which iroh watches.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use iroh::Watcher;
 use tracing::info;
@@ -31,13 +31,13 @@ impl Machine {
     pub(super) async fn watch_wake(self) {
         let mut addr = self.endpoint.watch_addr();
         let mut last = addr.get();
-        let mut mono = Instant::now();
+        let mut mono = crate::os::awake_time();
         let mut wall = SystemTime::now();
         loop {
             let why = tokio::select! {
                 _ = tokio::time::sleep(TICK) => {
-                    let (m, w) = (Instant::now(), SystemTime::now());
-                    let jumped = slept(w.duration_since(wall).unwrap_or_default(), m.duration_since(mono));
+                    let (m, w) = (crate::os::awake_time(), SystemTime::now());
+                    let jumped = slept(w.duration_since(wall).unwrap_or_default(), m.saturating_sub(mono));
                     (mono, wall) = (m, w);
                     if !jumped {
                         continue;

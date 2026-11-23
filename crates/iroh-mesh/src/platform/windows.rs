@@ -362,3 +362,11 @@ pub fn adopt_child(child: &tokio::process::Child) {
         }
     }
 }
+
+/// The unbiased interrupt time: time since boot without the time in sleep or hibernation.
+pub fn awake_time() -> std::time::Duration {
+    let mut t = 0u64;
+    // SAFETY: writes one u64 that lives on this stack.
+    unsafe { windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&mut t) };
+    std::time::Duration::from_nanos(t.saturating_mul(100))
+}
