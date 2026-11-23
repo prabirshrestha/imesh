@@ -15,7 +15,9 @@ use std::{
 use anyhow::{Context, Result};
 use iroh::RelayUrl;
 
-pub use devtunnel::{Connect as DevTunnel, Expose, Wake, delete_own as delete_devtunnel};
+pub use devtunnel::{
+    Connect as DevTunnel, Expose, Wake, delete_own as delete_devtunnel, set_label as set_devtunnel_label,
+};
 
 /// How a machine connects: its relays, address lookup, and the relay it serves. The default
 /// uses no n0 relays and no n0 address lookup: set `n0` or `relays` to reach machines behind NAT.

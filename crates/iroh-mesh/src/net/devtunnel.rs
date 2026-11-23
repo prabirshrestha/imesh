@@ -203,6 +203,27 @@ async fn dt(cli: Option<&Path>, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The label of this program's mesh tunnels, and the prefix of each tunnel's machine label and name:
+/// `imesh` unless the embedding program sets its own with [`set_label`], so two programs that both
+/// embed the mesh on one devtunnel login never list, forward or delete each other's tunnels.
+static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the label of this program's mesh tunnels (see [`LABEL`]), once, before any mesh starts.
+/// It must be a valid devtunnel label: lowercase letters, digits and hyphens. Later calls are
+/// ignored, and so is an invalid label.
+pub fn set_label(label: &str) {
+    if !label.is_empty()
+        && label.len() <= 20
+        && label.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    {
+        let _ = LABEL.set(label.to_string());
+    }
+}
+
+fn mesh_label() -> &'static str {
+    LABEL.get().map_or("imesh", String::as_str)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Tunnel {
@@ -229,12 +250,12 @@ async fn devtunnel(
     wake: &mut Wake,
 ) -> Result<bool> {
     let cli = owned.path();
-    let label = format!("imesh-{}", machine.fmt_short());
+    let label = format!("{}-{}", mesh_label(), machine.fmt_short());
     let tunnel = match id {
         Some(id) => {
             valid_id(id)?;
             if dt(cli, &["show", id, "-j"]).await.is_err() {
-                dt(cli, &["create", id, "-l", "imesh", "-l", &label, "-j"]).await?;
+                dt(cli, &["create", id, "-l", mesh_label(), "-l", &label, "-j"]).await?;
             }
             id.to_string()
         }
@@ -245,7 +266,7 @@ async fn devtunnel(
                 tunnels: Vec<Tunnel>,
             }
             let list: List = serde_json::from_value(json_of(
-                &dt(cli, &["list", "--all-labels", "imesh", "--all-labels", &label, "-j"]).await?,
+                &dt(cli, &["list", "--all-labels", mesh_label(), "--all-labels", &label, "-j"]).await?,
             )?)?;
             match list.tunnels.into_iter().next() {
                 Some(t) => t.tunnel_id,
@@ -255,7 +276,8 @@ async fn devtunnel(
                         tunnel: Tunnel,
                     }
                     let c: Created = serde_json::from_value(json_of(
-                        &dt(cli, &["create", &tunnel_name(name, machine), "-l", "imesh", "-l", &label, "-j"]).await?,
+                        &dt(cli, &["create", &tunnel_name(name, machine), "-l", mesh_label(), "-l", &label, "-j"])
+                            .await?,
                     )?)?;
                     c.tunnel.tunnel_id
                 }
@@ -321,7 +343,7 @@ pub(crate) async fn list_hosted(
         #[serde(default)]
         port_count: u64,
     }
-    let list: List = serde_json::from_value(json_of(&dt(cli, &["list", "--labels", "imesh", "-j"]).await?)?)?;
+    let list: List = serde_json::from_value(json_of(&dt(cli, &["list", "--labels", mesh_label(), "-j"]).await?)?)?;
     let seen: std::collections::BTreeSet<&str> = list.tunnels.iter().map(|t| t.tunnel_id.as_str()).collect();
     ports.retain(|id, _| seen.contains(id.as_str()));
     let mut out = Vec::new();
@@ -360,7 +382,7 @@ pub(crate) async fn list_hosted(
 fn machine_label(labels: &[String]) -> Option<&str> {
     labels
         .iter()
-        .filter_map(|l| l.strip_prefix("imesh-"))
+        .filter_map(|l| l.strip_prefix(mesh_label()).and_then(|l| l.strip_prefix('-')))
         .find(|id| id.len() == 10 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
 }
 
@@ -368,7 +390,7 @@ fn machine_label(labels: &[String]) -> Option<&str> {
 /// Only a tunnel that carries the machine's label is deleted, never a tunnel that the user named
 /// and shares.
 pub async fn delete_own(cli: Option<&Path>, tunnel: &str, machine: EndpointId) -> Result<bool> {
-    let label = format!("imesh-{}", machine.fmt_short());
+    let label = format!("{}-{}", mesh_label(), machine.fmt_short());
     let ours = dt(cli, &["show", tunnel, "-j"])
         .await
         .and_then(|out| json_of(&out))
@@ -401,10 +423,11 @@ pub(crate) fn tunnel_name(name: &str, machine: EndpointId) -> String {
             clean.push('-');
         }
     }
-    clean.truncate(49 - "imesh--".len() - 10);
+    clean.truncate(49 - mesh_label().len() - 2 - 10);
     let clean = clean.trim_end_matches('-');
     let id = machine.fmt_short();
-    if clean.is_empty() { format!("imesh-{id}") } else { format!("imesh-{clean}-{id}") }
+    let l = mesh_label();
+    if clean.is_empty() { format!("{l}-{id}") } else { format!("{l}-{clean}-{id}") }
 }
 
 /// The JSON object in devtunnel's output. The CLI can print a banner or a notice around it.
