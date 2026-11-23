@@ -135,9 +135,9 @@ impl Cli {
 }
 
 /// The mark of the machine whose data directory is `dir`: the first 16 hex of the BLAKE3 hash of
-/// its absolute path.
+/// its canonical path, so every spelling of the directory gives the same mark.
 fn owner_of(dir: &Path) -> String {
-    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = std::fs::canonicalize(dir).or_else(|_| std::path::absolute(dir)).unwrap_or_else(|_| dir.to_path_buf());
     blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex()[..16].to_string()
 }
 
@@ -159,12 +159,13 @@ fn reap_marked(mark: &str) -> usize {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+        // Without tasks: on Linux each thread would be an entry of its own, with the same environment.
+        ProcessRefreshKind::nothing().without_tasks().with_environ(UpdateKind::Always),
     );
     let me = sysinfo::Pid::from_u32(std::process::id());
     sys.processes()
         .iter()
-        .filter(|(pid, p)| **pid != me && p.environ().iter().any(|e| e == mark))
+        .filter(|(pid, p)| **pid != me && p.thread_kind().is_none() && p.environ().iter().any(|e| e == mark))
         .filter(|(_, p)| p.kill())
         .count()
 }
@@ -689,10 +690,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_start_stops_only_the_children_its_machine_left_behind() {
-        let mine = Cli::owned(None, Path::new("/tmp/imesh-reap-test-a"));
-        let theirs = Cli::owned(None, Path::new("/tmp/imesh-reap-test-b"));
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mine = Cli::owned(None, a.path());
+        let theirs = Cli::owned(None, b.path());
         assert_ne!(mine.owner, theirs.owner, "each data directory has its own mark");
-        assert_eq!(mine.owner, Cli::owned(None, Path::new("/tmp/imesh-reap-test-a")).owner);
+        assert_eq!(mine.owner, Cli::owned(None, &a.path().join(".")).owner, "one mark for every spelling");
         let sleeper = |cli: &Cli| {
             let mut c = tokio::process::Command::new(std::env::current_exe().unwrap());
             c.args(["--exact", "net::devtunnel::tests::sleep_as_child", "--ignored"])

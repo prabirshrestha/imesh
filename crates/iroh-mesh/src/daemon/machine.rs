@@ -252,7 +252,7 @@ impl Machine {
                 port,
                 self.id(),
                 self.name().to_string(),
-                net::devtunnel::Cli::owned(r.devtunnel_cli.clone(), &self.config.data_dir),
+                self.mesh.cli().clone(),
                 self.exposed.clone(),
                 self.wake.subscribe(),
             )

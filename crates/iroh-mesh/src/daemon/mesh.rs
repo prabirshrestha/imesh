@@ -43,6 +43,11 @@ impl Mesh {
         Mesh { forwards: Default::default(), changed: Default::default(), cli, wake }
     }
 
+    /// The devtunnel CLI, marked as this machine's.
+    pub(crate) fn cli(&self) -> &net::devtunnel::Cli {
+        &self.cli
+    }
+
     /// Fires when a forward becomes ready or stops.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
