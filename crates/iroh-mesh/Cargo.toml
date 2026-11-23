@@ -27,6 +27,7 @@ tokio-util = { version = "0.7.20", features = ["codec"] }
 tracing = "0.1.44"
 url = { version = "2.5.8", features = ["serde"] }
 gethostname = "1.1.0"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"

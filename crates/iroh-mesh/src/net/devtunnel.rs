@@ -59,7 +59,7 @@ pub(crate) fn expose(
     port: u16,
     machine: EndpointId,
     name: String,
-    cli: Option<PathBuf>,
+    cli: Cli,
     url: watch::Sender<Option<Hosted>>,
     mut wake: Wake,
 ) -> AbortOnDropHandle<()> {
@@ -67,7 +67,7 @@ pub(crate) fn expose(
         Expose::DevTunnel { id } => AbortOnDropHandle::new(tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match devtunnel(cli.as_deref(), id.as_deref(), port, machine, &name, &url, &mut wake).await {
+                match devtunnel(&cli, id.as_deref(), port, machine, &name, &url, &mut wake).await {
                     Ok(stable) => {
                         if stable {
                             backoff = Duration::from_secs(1);
@@ -86,6 +86,87 @@ pub(crate) fn expose(
 pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     // A saved path goes stale when the CLI moves, for example after an upgrade.
     tokio::process::Command::new(cli.filter(|p| p.exists()).unwrap_or(Path::new("devtunnel")))
+}
+
+/// The environment variable that marks a long-running devtunnel child (`host`, `connect`) with
+/// the machine that started it: a hash of its data directory.
+const OWNER_ENV: &str = "IMESH_DEVTUNNEL_OWNER";
+
+/// The devtunnel CLI, and the machine whose children it starts. A machine that stops by a crash
+/// or a kill cannot stop its children, and they keep running: a `devtunnel host` of the old run
+/// then serves the machine's tunnel too, with no relay behind it. So every long-running child
+/// carries its machine's mark ([`OWNER_ENV`]), and [`reap`] stops the marked ones of an earlier
+/// run when the machine starts again. Where the system can do more, a child also ends with the
+/// machine: on Linux by `PR_SET_PDEATHSIG`, on Windows in a job that closes with this process.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cli {
+    path: Option<PathBuf>,
+    owner: Option<String>,
+}
+
+impl Cli {
+    /// The CLI at `path`, for the machine whose data directory is `data_dir`.
+    pub(crate) fn owned(path: Option<PathBuf>, data_dir: &Path) -> Self {
+        Cli { path, owner: Some(owner_of(data_dir)) }
+    }
+
+    /// The CLI at `path`, with no machine: its children are stopped only when dropped.
+    pub(crate) fn plain(path: Option<PathBuf>) -> Self {
+        Cli { path, owner: None }
+    }
+
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Starts a long-running child: `devtunnel <args>`, marked with the machine, piped, and
+    /// stopped when dropped.
+    fn spawn(&self, args: &[&str], what: &str) -> Result<tokio::process::Child> {
+        let mut c = command(self.path());
+        c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        if let Some(owner) = &self.owner {
+            c.env(OWNER_ENV, owner);
+        }
+        crate::os::end_with_parent(&mut c);
+        let child = c.spawn().with_context(|| what.to_string())?;
+        crate::os::adopt_child(&child);
+        Ok(child)
+    }
+}
+
+/// The mark of the machine whose data directory is `dir`: the first 16 hex of the BLAKE3 hash of
+/// its absolute path.
+fn owner_of(dir: &Path) -> String {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex()[..16].to_string()
+}
+
+/// Stops the devtunnel children of an earlier run of `cli`'s machine: every process that carries
+/// its mark, other than this one. Call it after the machine holds its data directory, before it
+/// starts new children. Returns how many it stopped.
+pub(crate) async fn reap(cli: &Cli) -> usize {
+    let Some(owner) = cli.owner.clone() else { return 0 };
+    let n = tokio::task::spawn_blocking(move || reap_marked(&format!("{OWNER_ENV}={owner}"))).await.unwrap_or(0);
+    if n > 0 {
+        warn!(stopped = n, "stopped devtunnel children that an earlier run left behind");
+    }
+    n
+}
+
+fn reap_marked(mark: &str) -> usize {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Ok(mut sys) = System::new() else { return 0 };
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+    );
+    let me = sysinfo::Pid::from_u32(std::process::id());
+    sys.processes()
+        .iter()
+        .filter(|(pid, p)| **pid != me && p.environ().iter().any(|e| e == mark))
+        .filter(|(_, p)| p.kill())
+        .count()
 }
 
 async fn dt(cli: Option<&Path>, args: &[&str]) -> Result<String> {
@@ -124,7 +205,7 @@ struct Port {
 /// Finds or creates this machine's tunnel, adds the relay port, publishes the URL, and runs
 /// `devtunnel host` until it exits. Only the child started here is ever stopped.
 async fn devtunnel(
-    cli: Option<&Path>,
+    owned: &Cli,
     id: Option<&str>,
     port: u16,
     machine: EndpointId,
@@ -132,6 +213,7 @@ async fn devtunnel(
     url: &watch::Sender<Option<Hosted>>,
     wake: &mut Wake,
 ) -> Result<bool> {
+    let cli = owned.path();
     let label = format!("imesh-{}", machine.fmt_short());
     let tunnel = match id {
         Some(id) => {
@@ -184,14 +266,7 @@ async fn devtunnel(
     if !show.tunnel.ports.iter().any(|x| x.port_number == port) {
         dt(cli, &["port", "create", &tunnel, "-p", &p, "--protocol", "http"]).await?;
     }
-    let mut child = command(cli)
-        .args(["host", &tunnel])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start devtunnel host")?;
+    let mut child = owned.spawn(&["host", &tunnel], "start devtunnel host")?;
     // Clients authenticate with `devtunnel connect` and forward this same port locally.
     // The HTTPS web-forwarding URL stays private and is not an iroh relay address.
     let local: RelayUrl = format!("http://127.0.0.1:{port}/").parse()?;
@@ -313,10 +388,15 @@ impl Connect {
     /// Starts the CLI and waits for its forwarding announcement. Dropping the handle
     /// stops only this child. No login credentials or tokens enter imesh's database.
     /// `cli` is the devtunnel CLI, else `devtunnel` from the PATH.
-    pub async fn start(&self, cli: Option<PathBuf>, mut wake: Wake) -> Result<AbortOnDropHandle<()>> {
+    pub async fn start(&self, cli: Option<PathBuf>, wake: Wake) -> Result<AbortOnDropHandle<()>> {
+        self.start_owned(Cli::plain(cli), wake).await
+    }
+
+    /// As [`Connect::start`], with children marked as `cli`'s machine's.
+    pub(crate) async fn start_owned(&self, cli: Cli, mut wake: Wake) -> Result<AbortOnDropHandle<()>> {
         valid_id(&self.id)?;
         ensure!(self.port != 0, "devtunnel port must not be zero");
-        let (first, _) = self.connect(cli.as_deref(), true).await?;
+        let (first, _) = self.connect(&cli, true).await?;
         let config = self.clone();
         Ok(AbortOnDropHandle::new(tokio::spawn(async move {
             let mut child = first;
@@ -331,7 +411,7 @@ impl Connect {
                 }
                 loop {
                     backoff = nap(backoff, &mut wake).await;
-                    match config.connect(cli.as_deref(), true).await {
+                    match config.connect(&cli, true).await {
                         Ok((next, _)) => {
                             child = next;
                             break;
@@ -346,7 +426,7 @@ impl Connect {
     /// Starts one forwarding child and waits until it listens. Returns the child and its local
     /// port: the tunnel's port, or another one when that is in use. The caller owns the child:
     /// dropping it stops the forward.
-    pub(crate) async fn run_once(&self, cli: Option<&Path>) -> Result<(tokio::process::Child, u16)> {
+    pub(crate) async fn run_once(&self, cli: &Cli) -> Result<(tokio::process::Child, u16)> {
         self.connect(cli, false).await
     }
 
@@ -358,8 +438,8 @@ impl Connect {
 
     /// With `exact`, the local port must be the tunnel's port, because every member names the
     /// relay by that URL. Else the CLI may pick another free port, which it prints.
-    async fn connect(&self, cli: Option<&Path>, exact: bool) -> Result<(tokio::process::Child, u16)> {
-        let details = json_of(&dt(cli, &["show", &self.id, "-j"]).await?)?;
+    async fn connect(&self, owned: &Cli, exact: bool) -> Result<(tokio::process::Child, u16)> {
+        let details = json_of(&dt(owned.path(), &["show", &self.id, "-j"]).await?)?;
         ensure!(!anonymous(&details), "devtunnel {} allows anonymous access", self.id);
         let ports = details
             .pointer("/tunnel/ports")
@@ -378,14 +458,8 @@ impl Connect {
             let probe = probe.listen(1).with_context(|| format!("devtunnel local port {} is in use", self.port))?;
             drop(probe);
         }
-        let mut child = command(cli)
-            .args(["connect", &self.id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("start devtunnel connect (install the CLI and log in first)")?;
+        let mut child =
+            owned.spawn(&["connect", &self.id], "start devtunnel connect (install the CLI and log in first)")?;
         let port = wait_ready(&mut child, true).await?.expect("a forward reports its port");
         ensure!(!exact || port == self.port, "devtunnel local port {} is in use", self.port);
         Ok((child, port))
@@ -598,8 +672,9 @@ mod tests {
     async fn host_rejects_invalid_library_id_before_running_cli() {
         let url = watch::channel(None).0;
         let machine = iroh::SecretKey::generate().public();
-        let error =
-            devtunnel(None, Some("--help"), 3340, machine, "m", &url, &mut watch::channel(0).1).await.unwrap_err();
+        let error = devtunnel(&Cli::default(), Some("--help"), 3340, machine, "m", &url, &mut watch::channel(0).1)
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "invalid devtunnel ID");
         assert!(url.borrow().is_none());
     }
@@ -610,6 +685,32 @@ mod tests {
         if std::env::var_os("IMESH_TEST_CHILD").is_some() {
             std::thread::sleep(Duration::from_secs(600));
         }
+    }
+
+    #[tokio::test]
+    async fn a_start_stops_only_the_children_its_machine_left_behind() {
+        let mine = Cli::owned(None, Path::new("/tmp/imesh-reap-test-a"));
+        let theirs = Cli::owned(None, Path::new("/tmp/imesh-reap-test-b"));
+        assert_ne!(mine.owner, theirs.owner, "each data directory has its own mark");
+        assert_eq!(mine.owner, Cli::owned(None, Path::new("/tmp/imesh-reap-test-a")).owner);
+        let sleeper = |cli: &Cli| {
+            let mut c = tokio::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["--exact", "net::devtunnel::tests::sleep_as_child", "--ignored"])
+                .env("IMESH_TEST_CHILD", "1")
+                .env(OWNER_ENV, cli.owner.as_deref().unwrap())
+                .stdout(Stdio::null())
+                .kill_on_drop(true);
+            c.spawn().expect("run the test binary")
+        };
+        // A child of an earlier run, and one of another machine on this computer.
+        let mut left = sleeper(&mine);
+        let mut other = sleeper(&theirs);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(reap(&mine).await, 1);
+        let gone = tokio::time::timeout(Duration::from_secs(10), left.wait()).await;
+        assert!(gone.is_ok(), "the left child ends");
+        assert!(other.try_wait().unwrap().is_none(), "the other machine's child keeps running");
+        assert_eq!(reap(&Cli::plain(None)).await, 0, "a CLI with no machine stops nothing");
     }
 
     #[tokio::test]

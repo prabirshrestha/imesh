@@ -138,14 +138,17 @@ impl Builder {
         );
         let config = self.config;
         config.net.validate()?;
-        let devtunnel_cli = config.net.devtunnel_cli.clone();
-        let wake = tokio::sync::watch::channel(0u64).0;
-        let forwarding = match &config.net.devtunnel {
-            Some(tunnel) => Some(tunnel.start(config.net.devtunnel_cli.clone(), wake.subscribe()).await?),
-            None => None,
-        };
         crate::os::create_private_dir(&config.data_dir)?;
         let lock = lock_data_dir(&config.data_dir)?;
+        // This machine holds its data directory now: devtunnel children that carry its mark are
+        // from an earlier run that did not stop them.
+        let devtunnel_cli = net::devtunnel::Cli::owned(config.net.devtunnel_cli.clone(), &config.data_dir);
+        net::devtunnel::reap(&devtunnel_cli).await;
+        let wake = tokio::sync::watch::channel(0u64).0;
+        let forwarding = match &config.net.devtunnel {
+            Some(tunnel) => Some(tunnel.start_owned(devtunnel_cli.clone(), wake.subscribe()).await?),
+            None => None,
+        };
         remove_old_store(&config.data_dir);
         let secret = crate::os::load_or_create_key(&config.data_dir.join(KEY_FILE))?;
         let store = Store::open(&config.data_dir)?;

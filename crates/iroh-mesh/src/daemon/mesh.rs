@@ -33,13 +33,13 @@ pub(crate) struct Mesh {
     forwards: Mutex<BTreeMap<EndpointId, Forward>>,
     changed: watch::Sender<u64>,
     /// The devtunnel CLI, else `devtunnel` from the PATH.
-    cli: Option<std::path::PathBuf>,
+    cli: net::devtunnel::Cli,
     /// Wakes from sleep and network changes: each forward checks its member's relay at once.
     wake: net::devtunnel::Wake,
 }
 
 impl Mesh {
-    pub fn new(cli: Option<std::path::PathBuf>, wake: net::devtunnel::Wake) -> Self {
+    pub(crate) fn new(cli: net::devtunnel::Cli, wake: net::devtunnel::Wake) -> Self {
         Mesh { forwards: Default::default(), changed: Default::default(), cli, wake }
     }
 
@@ -128,7 +128,7 @@ impl Mesh {
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match connect.run_once(cli.as_deref()).await {
+                match connect.run_once(&cli).await {
                     Ok((mut child, local)) => {
                         info!(member = %id.fmt_short(), tunnel = %connect.id, port, local, "mesh relay forwarded");
                         set(Some(local));

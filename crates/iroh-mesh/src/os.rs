@@ -47,6 +47,18 @@ pub fn sd_notify_ready() {
     crate::platform::sd_notify_ready()
 }
 
+/// Makes a child that `c` starts end when this process ends, where the system can: on Linux by
+/// `PR_SET_PDEATHSIG`. Nothing elsewhere (see [`adopt_child`] for Windows).
+pub(crate) fn end_with_parent(c: &mut tokio::process::Command) {
+    crate::platform::end_with_parent(c)
+}
+
+/// On Windows, puts a started child in a job that ends it when this process ends. Nothing
+/// elsewhere.
+pub(crate) fn adopt_child(child: &tokio::process::Child) {
+    crate::platform::adopt_child(child)
+}
+
 /// Reads an iroh secret key (hex) from `path`, or creates one there, mode 0600.
 pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     match std::fs::read_to_string(path) {
