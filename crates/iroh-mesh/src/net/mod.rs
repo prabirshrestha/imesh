@@ -41,6 +41,9 @@ pub struct Config {
     pub pkarr: Option<url::Url>,
     /// Also find machines on the same LAN with mDNS.
     pub mdns: bool,
+    /// iroh's port mapping (UPnP, PCP, NAT-PMP): iroh's default unless set. It probes the local
+    /// network, and macOS asks for Local Network access for it.
+    pub portmapper: iroh::endpoint::PortmapperConfig,
     /// Run a members-only iroh relay on this TCP address, for example `0.0.0.0:3340`. Members and
     /// this machine may use it.
     pub serve_relay: Option<SocketAddr>,
