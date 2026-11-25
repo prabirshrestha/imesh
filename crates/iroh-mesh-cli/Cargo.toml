@@ -1,6 +1,6 @@
 [package]
 name = "iroh-mesh-cli"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/prabirshrestha/imesh"
@@ -14,7 +14,7 @@ name = "imesh"
 path = "src/main.rs"
 
 [dependencies]
-iroh-mesh = { path = "../iroh-mesh", version = "0.0.6" }
+iroh-mesh = { path = "../iroh-mesh", version = "0.0.7" }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 data-encoding = "2.11.1"

@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-mesh"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-mesh-cli"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "clap",
