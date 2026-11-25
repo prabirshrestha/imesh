@@ -1,3 +1,7 @@
 [alias]
 # Project tasks: `cargo x help`. The task runner is its own package, outside the workspace.
 x = "run -q --manifest-path xtask/Cargo.toml --"
+
+# The MSVC build links the C runtime in, so that Windows needs no Visual C++ redistributable.
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

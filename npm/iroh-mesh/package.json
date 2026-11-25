@@ -23,6 +23,7 @@
     "iroh-mesh-darwin-arm64": "0.0.5",
     "iroh-mesh-linux-arm64": "0.0.5",
     "iroh-mesh-linux-x64": "0.0.5",
+    "iroh-mesh-windows-arm64": "0.0.5",
     "iroh-mesh-windows-x64": "0.0.5"
   }
 }

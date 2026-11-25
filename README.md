@@ -13,7 +13,7 @@ and bandwidth.
 imesh also has built-in SSH. `imesh ssh machine2` opens a shell on another member, with no
 `sshd`, no SSH keys, and no passwords.
 
-imesh runs on Linux, macOS, and Windows. It needs no root or sudo.
+imesh runs on Linux, macOS, and Windows (x64 and arm64). It needs no root or sudo.
 
 ## Install
 
@@ -232,7 +232,8 @@ cargo x install
 `cargo x install` builds imesh for every platform, makes the npm packages, and installs them with
 `npm install -g`, the same as the published package. Then `imesh` is on your PATH.
 
-`cargo x tools` installs the build tools on macOS: Zig, cargo-zigbuild, and MinGW-w64.
+`cargo x tools` installs the build tools on macOS: Zig, cargo-zigbuild, and MinGW-w64. The
+Windows arm64 build also needs LLVM on your PATH (`brew install llvm`, then add `$(brew --prefix llvm)/bin`) and [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (`cargo install --locked cargo-xwin`). It downloads Microsoft's C runtime and Windows SDK libraries on first use, about 1 GB.
 Run `imesh --help` for every command.
 
 ## License
