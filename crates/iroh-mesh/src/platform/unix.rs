@@ -146,3 +146,38 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
+
+/// On Linux, the child gets SIGTERM when this process ends (`PR_SET_PDEATHSIG`). The signal
+/// follows the thread that starts the child; tokio starts it on a runtime worker. If that thread
+/// ends first the child ends early, and its supervisor starts it again. Nothing on macOS, which
+/// has no such signal: there `net::devtunnel::reap` stops what is left at the next start.
+pub fn end_with_parent(c: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: only async-signal-safe calls run between fork and exec.
+        unsafe {
+            c.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The parent ended before the prctl: no signal comes for it.
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = c;
+}
+
+pub fn adopt_child(_: &tokio::process::Child) {}
+
+/// From the first call. `Instant` stops while the computer sleeps here: `CLOCK_UPTIME_RAW` on
+/// macOS, `CLOCK_MONOTONIC` on Linux.
+pub fn awake_time() -> std::time::Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}

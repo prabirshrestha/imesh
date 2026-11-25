@@ -6,6 +6,7 @@ mod links;
 mod machine;
 mod mesh;
 pub(crate) mod methods;
+mod wake;
 
 use std::{
     collections::BTreeMap,
@@ -137,13 +138,17 @@ impl Builder {
         );
         let config = self.config;
         config.net.validate()?;
-        let devtunnel_cli = config.net.devtunnel_cli.clone();
-        let forwarding = match &config.net.devtunnel {
-            Some(tunnel) => Some(tunnel.start(config.net.devtunnel_cli.clone()).await?),
-            None => None,
-        };
         crate::os::create_private_dir(&config.data_dir)?;
         let lock = lock_data_dir(&config.data_dir)?;
+        // This machine holds its data directory now: devtunnel children that carry its mark are
+        // from an earlier run that did not stop them.
+        let devtunnel_cli = net::devtunnel::Cli::owned(config.net.devtunnel_cli.clone(), &config.data_dir);
+        net::devtunnel::reap(&devtunnel_cli).await;
+        let wake = tokio::sync::watch::channel(0u64).0;
+        let forwarding = match &config.net.devtunnel {
+            Some(tunnel) => Some(tunnel.start_owned(devtunnel_cli.clone(), wake.subscribe()).await?),
+            None => None,
+        };
         remove_old_store(&config.data_dir);
         let secret = crate::os::load_or_create_key(&config.data_dir.join(KEY_FILE))?;
         let store = Store::open(&config.data_dir)?;
@@ -165,7 +170,8 @@ impl Builder {
             hellos: Default::default(),
             answering: Default::default(),
             exposed: tokio::sync::watch::channel(None).0,
-            mesh: mesh::Mesh::new(devtunnel_cli),
+            mesh: mesh::Mesh::new(devtunnel_cli, wake.subscribe()),
+            wake,
             relays: tokio::sync::Mutex::new(initial.clone()),
             joining: Default::default(),
             reset: tokio::sync::watch::channel(false).0,
@@ -183,7 +189,11 @@ impl Builder {
         let mut tasks = vec![
             AbortOnDropHandle::new(tokio::spawn(machine.clone().background())),
             AbortOnDropHandle::new(tokio::spawn(machine.clone().sync_loop())),
+            AbortOnDropHandle::new(tokio::spawn(machine.clone().watch_wake())),
         ];
+        if machine.config.net.devtunnel_mesh {
+            tasks.push(AbortOnDropHandle::new(tokio::spawn(machine.clone().list_tunnels())));
+        }
         tasks.extend(tunnel);
         tasks.extend(forwarding);
         info!(id = %machine.id(), name = %machine.name, "machine started");
@@ -209,6 +219,7 @@ async fn bind_endpoint(
     admission: &Admission,
 ) -> Result<iroh::Endpoint> {
     let mut b = net::endpoint_builder(net.n0, relays, net.relay_ca.as_deref(), net.proxy.as_ref())?;
+    b = b.portmapper_config(net.portmapper.clone());
     if net.relay_only {
         b = b.clear_ip_transports();
     } else if let Some(addr) = net.bind {

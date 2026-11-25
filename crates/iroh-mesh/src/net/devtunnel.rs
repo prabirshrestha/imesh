@@ -12,7 +12,7 @@ use n0_future::task::AbortOnDropHandle;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How a machine publishes the relay it serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,14 +59,15 @@ pub(crate) fn expose(
     port: u16,
     machine: EndpointId,
     name: String,
-    cli: Option<PathBuf>,
+    cli: Cli,
     url: watch::Sender<Option<Hosted>>,
+    mut wake: Wake,
 ) -> AbortOnDropHandle<()> {
     match how {
         Expose::DevTunnel { id } => AbortOnDropHandle::new(tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match devtunnel(cli.as_deref(), id.as_deref(), port, machine, &name, &url).await {
+                match devtunnel(&cli, id.as_deref(), port, machine, &name, &url, &mut wake).await {
                     Ok(stable) => {
                         if stable {
                             backoff = Duration::from_secs(1);
@@ -75,8 +76,7 @@ pub(crate) fn expose(
                     }
                     Err(e) => warn!("devtunnel: {e:#}"),
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
+                backoff = nap(backoff, &mut wake).await;
             }
         })),
     }
@@ -85,7 +85,103 @@ pub(crate) fn expose(
 /// The devtunnel CLI: `cli`, else `devtunnel` from the PATH.
 pub(crate) fn command(cli: Option<&Path>) -> tokio::process::Command {
     // A saved path goes stale when the CLI moves, for example after an upgrade.
-    tokio::process::Command::new(cli.filter(|p| p.exists()).unwrap_or(Path::new("devtunnel")))
+    // A relative path is from our folder, not the home the CLI runs in.
+    let cli = cli.filter(|p| p.exists()).map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()));
+    let mut c = tokio::process::Command::new(cli.as_deref().unwrap_or(Path::new("devtunnel")));
+    // The CLI keeps its login under the user's data folder, and where that folder does not exist
+    // (no ~/.local/share on Linux) it uses ./DevTunnels instead. So run it from the home folder:
+    // from another folder it does not find the login and says "Login required".
+    if let Some(home) = std::env::home_dir().filter(|h| h.is_dir()) {
+        c.current_dir(home);
+    }
+    // On Windows, a console program started by a process with no console (a node started by a
+    // scheduled task, a service or the app) opens its own console window, and `devtunnel host`
+    // keeps it open for as long as it runs. CREATE_NO_WINDOW starts it without one.
+    #[cfg(windows)]
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+/// The environment variable that marks a long-running devtunnel child (`host`, `connect`) with
+/// the machine that started it: a hash of its data directory.
+const OWNER_ENV: &str = "IMESH_DEVTUNNEL_OWNER";
+
+/// The devtunnel CLI, and the machine whose children it starts. A machine that stops by a crash
+/// or a kill cannot stop its children, and they keep running: a `devtunnel host` of the old run
+/// then serves the machine's tunnel too, with no relay behind it. So every long-running child
+/// carries its machine's mark ([`OWNER_ENV`]), and [`reap`] stops the marked ones of an earlier
+/// run when the machine starts again. Where the system can do more, a child also ends with the
+/// machine: on Linux by `PR_SET_PDEATHSIG`, on Windows in a job that closes with this process.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cli {
+    path: Option<PathBuf>,
+    owner: Option<String>,
+}
+
+impl Cli {
+    /// The CLI at `path`, for the machine whose data directory is `data_dir`.
+    pub(crate) fn owned(path: Option<PathBuf>, data_dir: &Path) -> Self {
+        Cli { path, owner: Some(owner_of(data_dir)) }
+    }
+
+    /// The CLI at `path`, with no machine: its children are stopped only when dropped.
+    pub(crate) fn plain(path: Option<PathBuf>) -> Self {
+        Cli { path, owner: None }
+    }
+
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Starts a long-running child: `devtunnel <args>`, marked with the machine, piped, and
+    /// stopped when dropped.
+    fn spawn(&self, args: &[&str], what: &str) -> Result<tokio::process::Child> {
+        let mut c = command(self.path());
+        c.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        if let Some(owner) = &self.owner {
+            c.env(OWNER_ENV, owner);
+        }
+        crate::os::end_with_parent(&mut c);
+        let child = c.spawn().with_context(|| what.to_string())?;
+        crate::os::adopt_child(&child);
+        Ok(child)
+    }
+}
+
+/// The mark of the machine whose data directory is `dir`: the first 16 hex of the BLAKE3 hash of
+/// its canonical path, so every spelling of the directory gives the same mark.
+fn owner_of(dir: &Path) -> String {
+    let dir = std::fs::canonicalize(dir).or_else(|_| std::path::absolute(dir)).unwrap_or_else(|_| dir.to_path_buf());
+    blake3::hash(dir.as_os_str().as_encoded_bytes()).to_hex()[..16].to_string()
+}
+
+/// Stops the devtunnel children of an earlier run of `cli`'s machine: every process that carries
+/// its mark, other than this one. Call it after the machine holds its data directory, before it
+/// starts new children. Returns how many it stopped.
+pub(crate) async fn reap(cli: &Cli) -> usize {
+    let Some(owner) = cli.owner.clone() else { return 0 };
+    let n = tokio::task::spawn_blocking(move || reap_marked(&format!("{OWNER_ENV}={owner}"))).await.unwrap_or(0);
+    if n > 0 {
+        warn!(stopped = n, "stopped devtunnel children that an earlier run left behind");
+    }
+    n
+}
+
+fn reap_marked(mark: &str) -> usize {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let Ok(mut sys) = System::new() else { return 0 };
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        // Without tasks: on Linux each thread would be an entry of its own, with the same environment.
+        ProcessRefreshKind::nothing().without_tasks().with_environ(UpdateKind::Always),
+    );
+    let me = sysinfo::Pid::from_u32(std::process::id());
+    sys.processes()
+        .iter()
+        .filter(|(pid, p)| **pid != me && p.thread_kind().is_none() && p.environ().iter().any(|e| e == mark))
+        .filter(|(_, p)| p.kill())
+        .count()
 }
 
 async fn dt(cli: Option<&Path>, args: &[&str]) -> Result<String> {
@@ -107,6 +203,27 @@ async fn dt(cli: Option<&Path>, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The label of this program's mesh tunnels, and the prefix of each tunnel's machine label and name:
+/// `imesh` unless the embedding program sets its own with [`set_label`], so two programs that both
+/// embed the mesh on one devtunnel login never list, forward or delete each other's tunnels.
+static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the label of this program's mesh tunnels (see [`LABEL`]), once, before any mesh starts.
+/// It must be a valid devtunnel label: lowercase letters, digits and hyphens. Later calls are
+/// ignored, and so is an invalid label.
+pub fn set_label(label: &str) {
+    if !label.is_empty()
+        && label.len() <= 20
+        && label.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    {
+        let _ = LABEL.set(label.to_string());
+    }
+}
+
+fn mesh_label() -> &'static str {
+    LABEL.get().map_or("imesh", String::as_str)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Tunnel {
@@ -124,19 +241,21 @@ struct Port {
 /// Finds or creates this machine's tunnel, adds the relay port, publishes the URL, and runs
 /// `devtunnel host` until it exits. Only the child started here is ever stopped.
 async fn devtunnel(
-    cli: Option<&Path>,
+    owned: &Cli,
     id: Option<&str>,
     port: u16,
     machine: EndpointId,
     name: &str,
     url: &watch::Sender<Option<Hosted>>,
+    wake: &mut Wake,
 ) -> Result<bool> {
-    let label = format!("imesh-{}", machine.fmt_short());
+    let cli = owned.path();
+    let label = format!("{}-{}", mesh_label(), machine.fmt_short());
     let tunnel = match id {
         Some(id) => {
             valid_id(id)?;
             if dt(cli, &["show", id, "-j"]).await.is_err() {
-                dt(cli, &["create", id, "-l", "imesh", "-l", &label, "-j"]).await?;
+                dt(cli, &["create", id, "-l", mesh_label(), "-l", &label, "-j"]).await?;
             }
             id.to_string()
         }
@@ -147,7 +266,7 @@ async fn devtunnel(
                 tunnels: Vec<Tunnel>,
             }
             let list: List = serde_json::from_value(json_of(
-                &dt(cli, &["list", "--all-labels", "imesh", "--all-labels", &label, "-j"]).await?,
+                &dt(cli, &["list", "--all-labels", mesh_label(), "--all-labels", &label, "-j"]).await?,
             )?)?;
             match list.tunnels.into_iter().next() {
                 Some(t) => t.tunnel_id,
@@ -157,7 +276,8 @@ async fn devtunnel(
                         tunnel: Tunnel,
                     }
                     let c: Created = serde_json::from_value(json_of(
-                        &dt(cli, &["create", &tunnel_name(name, machine), "-l", "imesh", "-l", &label, "-j"]).await?,
+                        &dt(cli, &["create", &tunnel_name(name, machine), "-l", mesh_label(), "-l", &label, "-j"])
+                            .await?,
                     )?)?;
                     c.tunnel.tunnel_id
                 }
@@ -183,14 +303,7 @@ async fn devtunnel(
     if !show.tunnel.ports.iter().any(|x| x.port_number == port) {
         dt(cli, &["port", "create", &tunnel, "-p", &p, "--protocol", "http"]).await?;
     }
-    let mut child = command(cli)
-        .args(["host", &tunnel])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start devtunnel host")?;
+    let mut child = owned.spawn(&["host", &tunnel], "start devtunnel host")?;
     // Clients authenticate with `devtunnel connect` and forward this same port locally.
     // The HTTPS web-forwarding URL stays private and is not an iroh relay address.
     let local: RelayUrl = format!("http://127.0.0.1:{port}/").parse()?;
@@ -198,18 +311,86 @@ async fn devtunnel(
     info!(%tunnel, %local, "private relay hosted through devtunnel");
     url.send_replace(Some(Hosted { url: local, tunnel: tunnel.clone() }));
     let started = tokio::time::Instant::now();
-    let status = supervise(&mut child, CHECK_EVERY, || hosted(cli, &tunnel)).await;
+    let status = supervise(&mut child, CHECK_EVERY, wake, || hosted(cli, &tunnel)).await;
     url.send_replace(None);
     let status = status?;
     info!(%status, "devtunnel host stopped");
     Ok(started.elapsed() >= Duration::from_secs(60))
 }
 
+/// The mesh tunnels of this devtunnel login that a host serves now, other than `mine`: by the
+/// short machine ID of each one's `imesh-<id>` label, each with its relay port. A tunnel with no
+/// host, with a port count other than one, or with anonymous access is left out. `ports` keeps the
+/// port of each tunnel seen, so only a new tunnel costs a `devtunnel show`.
+pub(crate) async fn list_hosted(
+    cli: Option<&Path>,
+    mine: &str,
+    ports: &mut std::collections::BTreeMap<String, u16>,
+) -> Result<Vec<(String, crate::state::TunnelEndpoint)>> {
+    #[derive(Deserialize)]
+    struct List {
+        #[serde(default)]
+        tunnels: Vec<Listed>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Listed {
+        tunnel_id: String,
+        #[serde(default)]
+        host_connections: u64,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        port_count: u64,
+    }
+    let list: List = serde_json::from_value(json_of(&dt(cli, &["list", "--labels", mesh_label(), "-j"]).await?)?)?;
+    let seen: std::collections::BTreeSet<&str> = list.tunnels.iter().map(|t| t.tunnel_id.as_str()).collect();
+    ports.retain(|id, _| seen.contains(id.as_str()));
+    let mut out = Vec::new();
+    for t in &list.tunnels {
+        let Some(short) = machine_label(&t.labels) else { continue };
+        if short == mine || t.host_connections == 0 || t.port_count != 1 || valid_id(&t.tunnel_id).is_err() {
+            continue;
+        }
+        let port = match ports.get(&t.tunnel_id) {
+            Some(p) => *p,
+            None => {
+                let details = match dt(cli, &["show", &t.tunnel_id, "-j"]).await.and_then(|o| json_of(&o)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        debug!(tunnel = %t.tunnel_id, "devtunnel show: {e:#}");
+                        continue;
+                    }
+                };
+                let one = details.pointer("/tunnel/ports").and_then(|p| p.as_array()).filter(|p| p.len() == 1);
+                let Some(p) = one.and_then(|p| p[0]["portNumber"].as_u64()).and_then(|p| u16::try_from(p).ok()) else {
+                    continue;
+                };
+                if anonymous(&details) || p == 0 {
+                    continue;
+                }
+                ports.insert(t.tunnel_id.clone(), p);
+                p
+            }
+        };
+        out.push((short.to_string(), crate::state::TunnelEndpoint::Devtunnel { id: t.tunnel_id.clone(), port }));
+    }
+    Ok(out)
+}
+
+/// The short machine ID of a mesh tunnel's `imesh-<id>` label: 10 lowercase hex characters.
+fn machine_label(labels: &[String]) -> Option<&str> {
+    labels
+        .iter()
+        .filter_map(|l| l.strip_prefix(mesh_label()).and_then(|l| l.strip_prefix('-')))
+        .find(|id| id.len() == 10 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+}
+
 /// Deletes the tunnel that a machine hosted, after it left its cluster and its daemon stopped.
 /// Only a tunnel that carries the machine's label is deleted, never a tunnel that the user named
 /// and shares.
 pub async fn delete_own(cli: Option<&Path>, tunnel: &str, machine: EndpointId) -> Result<bool> {
-    let label = format!("imesh-{}", machine.fmt_short());
+    let label = format!("{}-{}", mesh_label(), machine.fmt_short());
     let ours = dt(cli, &["show", tunnel, "-j"])
         .await
         .and_then(|out| json_of(&out))
@@ -242,10 +423,11 @@ pub(crate) fn tunnel_name(name: &str, machine: EndpointId) -> String {
             clean.push('-');
         }
     }
-    clean.truncate(49 - "imesh--".len() - 10);
+    clean.truncate(49 - mesh_label().len() - 2 - 10);
     let clean = clean.trim_end_matches('-');
     let id = machine.fmt_short();
-    if clean.is_empty() { format!("imesh-{id}") } else { format!("imesh-{clean}-{id}") }
+    let l = mesh_label();
+    if clean.is_empty() { format!("{l}-{id}") } else { format!("{l}-{clean}-{id}") }
 }
 
 /// The JSON object in devtunnel's output. The CLI can print a banner or a notice around it.
@@ -312,26 +494,30 @@ impl Connect {
     /// Starts the CLI and waits for its forwarding announcement. Dropping the handle
     /// stops only this child. No login credentials or tokens enter imesh's database.
     /// `cli` is the devtunnel CLI, else `devtunnel` from the PATH.
-    pub async fn start(&self, cli: Option<PathBuf>) -> Result<AbortOnDropHandle<()>> {
+    pub async fn start(&self, cli: Option<PathBuf>, wake: Wake) -> Result<AbortOnDropHandle<()>> {
+        self.start_owned(Cli::plain(cli), wake).await
+    }
+
+    /// As [`Connect::start`], with children marked as `cli`'s machine's.
+    pub(crate) async fn start_owned(&self, cli: Cli, mut wake: Wake) -> Result<AbortOnDropHandle<()>> {
         valid_id(&self.id)?;
         ensure!(self.port != 0, "devtunnel port must not be zero");
-        let (first, _) = self.connect(cli.as_deref(), true).await?;
+        let (first, _) = self.connect(&cli, true).await?;
         let config = self.clone();
         Ok(AbortOnDropHandle::new(tokio::spawn(async move {
             let mut child = first;
             let mut backoff = Duration::from_secs(1);
             loop {
                 let started = tokio::time::Instant::now();
-                if let Ok(why) = supervise(&mut child, CHECK_EVERY, || listening(config.port)).await {
+                if let Ok(why) = supervise(&mut child, CHECK_EVERY, &mut wake, || relay_answers(config.port)).await {
                     warn!(tunnel = %config.id, "devtunnel connect stopped: {why}");
                 }
                 if started.elapsed() >= Duration::from_secs(60) {
                     backoff = Duration::from_secs(1);
                 }
                 loop {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(60));
-                    match config.connect(cli.as_deref(), true).await {
+                    backoff = nap(backoff, &mut wake).await;
+                    match config.connect(&cli, true).await {
                         Ok((next, _)) => {
                             child = next;
                             break;
@@ -346,20 +532,20 @@ impl Connect {
     /// Starts one forwarding child and waits until it listens. Returns the child and its local
     /// port: the tunnel's port, or another one when that is in use. The caller owns the child:
     /// dropping it stops the forward.
-    pub(crate) async fn run_once(&self, cli: Option<&Path>) -> Result<(tokio::process::Child, u16)> {
+    pub(crate) async fn run_once(&self, cli: &Cli) -> Result<(tokio::process::Child, u16)> {
         self.connect(cli, false).await
     }
 
-    /// Runs until the forwarding child exits, or stops it when its local `port` stops accepting
-    /// connections. Returns why it stopped.
-    pub(crate) async fn watch(&self, child: &mut tokio::process::Child, port: u16) -> Result<String> {
-        supervise(child, CHECK_EVERY, || listening(port)).await
+    /// Runs until the forwarding child exits, or stops it when the member's relay stops answering
+    /// through its local `port`. Returns why it stopped.
+    pub(crate) async fn watch(&self, child: &mut tokio::process::Child, port: u16, wake: &mut Wake) -> Result<String> {
+        supervise(child, CHECK_EVERY, wake, || relay_answers(port)).await
     }
 
     /// With `exact`, the local port must be the tunnel's port, because every member names the
     /// relay by that URL. Else the CLI may pick another free port, which it prints.
-    async fn connect(&self, cli: Option<&Path>, exact: bool) -> Result<(tokio::process::Child, u16)> {
-        let details = json_of(&dt(cli, &["show", &self.id, "-j"]).await?)?;
+    async fn connect(&self, owned: &Cli, exact: bool) -> Result<(tokio::process::Child, u16)> {
+        let details = json_of(&dt(owned.path(), &["show", &self.id, "-j"]).await?)?;
         ensure!(!anonymous(&details), "devtunnel {} allows anonymous access", self.id);
         let ports = details
             .pointer("/tunnel/ports")
@@ -378,14 +564,8 @@ impl Connect {
             let probe = probe.listen(1).with_context(|| format!("devtunnel local port {} is in use", self.port))?;
             drop(probe);
         }
-        let mut child = command(cli)
-            .args(["connect", &self.id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("start devtunnel connect (install the CLI and log in first)")?;
+        let mut child =
+            owned.spawn(&["connect", &self.id], "start devtunnel connect (install the CLI and log in first)")?;
         let port = wait_ready(&mut child, true).await?.expect("a forward reports its port");
         ensure!(!exact || port == self.port, "devtunnel local port {} is in use", self.port);
         Ok((child, port))
@@ -404,28 +584,55 @@ enum Check {
     Unknown(String),
 }
 
+/// Fires when the computer woke from sleep or its network changed (see `daemon::wake`): the
+/// devtunnel children are checked at once then, and a child that waits to start again starts now.
+pub type Wake = watch::Receiver<u64>;
+
+/// Resolves on the next wake. Never, when no one sends wakes any more.
+async fn woken(wake: &mut Wake) {
+    if wake.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Sleeps `backoff`, or less when a wake comes. Gives the next backoff: doubled up to a minute,
+/// or one second again after a wake.
+pub(crate) async fn nap(backoff: Duration, wake: &mut Wake) -> Duration {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff) => (backoff * 2).min(Duration::from_secs(60)),
+        _ = woken(wake) => Duration::from_secs(1),
+    }
+}
+
 /// Waits for `child` to exit. A devtunnel child can stay running after it loses its connection to
 /// the service, and then nothing restarts it. So `check` runs every `every`, and after
-/// [`CHECK_FAILURES`] `Down` results in a row the child is stopped. The caller then starts a new
-/// one.
-async fn supervise<F, Fut>(child: &mut tokio::process::Child, every: Duration, check: F) -> Result<String>
+/// [`CHECK_FAILURES`] `Down` results in a row the child is stopped. A wake runs `check` at once,
+/// and one `Down` then stops the child: after sleep or a network change, its connection is most
+/// likely gone. The caller then starts a new one.
+async fn supervise<F, Fut>(
+    child: &mut tokio::process::Child,
+    every: Duration,
+    wake: &mut Wake,
+    check: F,
+) -> Result<String>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Check>,
 {
     let mut failures = 0;
     loop {
-        let result = tokio::select! {
+        let (result, woke) = tokio::select! {
             status = child.wait() => return Ok(format!("exited: {}", status?)),
-            result = async { tokio::time::sleep(every).await; check().await } => result,
+            result = async { tokio::time::sleep(every).await; check().await } => (result, false),
+            result = async { woken(wake).await; check().await } => (result, true),
         };
         match result {
             Check::Alive => failures = 0,
             Check::Unknown(e) => tracing::debug!("devtunnel check could not run: {e}"),
             Check::Down(e) => {
                 failures += 1;
-                warn!(failures, "devtunnel check failed: {e}");
-                if failures >= CHECK_FAILURES {
+                warn!(failures, woke, "devtunnel check failed: {e}");
+                if woke || failures >= CHECK_FAILURES {
                     let _ = child.kill().await;
                     return Ok(format!("stopped after {failures} failed checks: {e}"));
                 }
@@ -452,14 +659,47 @@ fn host_connections(details: &serde_json::Value, tunnel: &str) -> Check {
     }
 }
 
-/// The forwarded port accepts connections: `devtunnel connect` still listens.
-async fn listening(port: u16) -> Check {
-    let connect = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port));
-    match tokio::time::timeout(Duration::from_secs(5), connect).await {
-        Ok(Ok(_)) => Check::Alive,
-        Ok(Err(e)) => Check::Down(format!("nothing listens on 127.0.0.1:{port}: {e}")),
-        Err(_) => Check::Down(format!("127.0.0.1:{port} did not accept a connection within 5 seconds")),
+/// The member's relay answers through the forward: `GET /healthz` on the forwarded port goes
+/// through `devtunnel connect`, the service and the member's `devtunnel host` to its relay. A
+/// forward can listen and still carry nothing, after sleep or a network change.
+async fn relay_answers(port: u16) -> Check {
+    match tokio::time::timeout(RELAY_CHECK_TIMEOUT, healthz(port)).await {
+        Ok(Ok(200)) => Check::Alive,
+        Ok(Ok(status)) => Check::Down(format!("the relay through 127.0.0.1:{port} answered {status}")),
+        Ok(Err(e)) => Check::Down(format!("no relay answers through 127.0.0.1:{port}: {e:#}")),
+        Err(_) => Check::Down(format!(
+            "the relay through 127.0.0.1:{port} did not answer within {} seconds",
+            RELAY_CHECK_TIMEOUT.as_secs()
+        )),
     }
+}
+
+const RELAY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The status of `GET /healthz` on the loopback `port`.
+async fn healthz(port: u16) -> Result<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    stream
+        .write_all(format!("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await?;
+    let mut head = Vec::new();
+    let mut buf = [0u8; 256];
+    while !head.windows(2).any(|w| w == b"\r\n") {
+        let n = stream.read(&mut buf).await?;
+        ensure!(n != 0, "the connection closed before an answer");
+        head.extend_from_slice(&buf[..n]);
+        ensure!(head.len() < 4096, "the answer has no status line");
+    }
+    status_of(&head).context("the answer is not HTTP")
+}
+
+/// The status code of an HTTP status line: `HTTP/1.1 200 OK`.
+fn status_of(head: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(head).ok()?.lines().next()?;
+    let mut words = line.split_whitespace();
+    words.next().filter(|v| v.starts_with("HTTP/"))?;
+    words.next()?.parse().ok()
 }
 
 /// Waits until a host is ready, or with `forward` until a forward listens. Returns the forward's
@@ -538,7 +778,9 @@ mod tests {
     async fn host_rejects_invalid_library_id_before_running_cli() {
         let url = watch::channel(None).0;
         let machine = iroh::SecretKey::generate().public();
-        let error = devtunnel(None, Some("--help"), 3340, machine, "m", &url).await.unwrap_err();
+        let error = devtunnel(&Cli::default(), Some("--help"), 3340, machine, "m", &url, &mut watch::channel(0).1)
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "invalid devtunnel ID");
         assert!(url.borrow().is_none());
     }
@@ -549,6 +791,33 @@ mod tests {
         if std::env::var_os("IMESH_TEST_CHILD").is_some() {
             std::thread::sleep(Duration::from_secs(600));
         }
+    }
+
+    #[tokio::test]
+    async fn a_start_stops_only_the_children_its_machine_left_behind() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mine = Cli::owned(None, a.path());
+        let theirs = Cli::owned(None, b.path());
+        assert_ne!(mine.owner, theirs.owner, "each data directory has its own mark");
+        assert_eq!(mine.owner, Cli::owned(None, &a.path().join(".")).owner, "one mark for every spelling");
+        let sleeper = |cli: &Cli| {
+            let mut c = tokio::process::Command::new(std::env::current_exe().unwrap());
+            c.args(["--exact", "net::devtunnel::tests::sleep_as_child", "--ignored"])
+                .env("IMESH_TEST_CHILD", "1")
+                .env(OWNER_ENV, cli.owner.as_deref().unwrap())
+                .stdout(Stdio::null())
+                .kill_on_drop(true);
+            c.spawn().expect("run the test binary")
+        };
+        // A child of an earlier run, and one of another machine on this computer.
+        let mut left = sleeper(&mine);
+        let mut other = sleeper(&theirs);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(reap(&mine).await, 1);
+        let gone = tokio::time::timeout(Duration::from_secs(10), left.wait()).await;
+        assert!(gone.is_ok(), "the left child ends");
+        assert!(other.try_wait().unwrap().is_none(), "the other machine's child keeps running");
+        assert_eq!(reap(&Cli::plain(None)).await, 0, "a CLI with no machine stops nothing");
     }
 
     #[tokio::test]
@@ -564,22 +833,92 @@ mod tests {
                 .expect("run the test binary")
         };
         let every = Duration::from_millis(10);
+        let (_tx, wake) = watch::channel(0);
         let mut stuck = spawn();
-        let why = supervise(&mut stuck, every, || async { Check::Down("down".into()) }).await.unwrap();
+        let why =
+            supervise(&mut stuck, every, &mut wake.clone(), || async { Check::Down("down".into()) }).await.unwrap();
         assert!(why.starts_with("stopped after 3 failed checks"), "{why}");
         assert!(stuck.try_wait().unwrap().is_some(), "the stuck child was stopped");
 
         let mut healthy = spawn();
-        let kept =
-            tokio::time::timeout(Duration::from_millis(200), supervise(&mut healthy, every, || async { Check::Alive }));
+        let mut w = wake.clone();
+        let kept = tokio::time::timeout(
+            Duration::from_millis(200),
+            supervise(&mut healthy, every, &mut w, || async { Check::Alive }),
+        );
         assert!(kept.await.is_err(), "a child that passes its checks keeps running");
 
         let mut unknown = spawn();
-        let kept = supervise(&mut unknown, every, || async { Check::Unknown("slow".into()) });
+        let mut w = wake.clone();
+        let kept = supervise(&mut unknown, every, &mut w, || async { Check::Unknown("slow".into()) });
         assert!(
             tokio::time::timeout(Duration::from_millis(200), kept).await.is_err(),
             "a check that cannot run does not stop the child"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_checks_at_once_and_one_failure_then_stops_the_child() {
+        let spawn = || {
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "net::devtunnel::tests::sleep_as_child", "--ignored"])
+                .env("IMESH_TEST_CHILD", "1")
+                .stdout(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("run the test binary")
+        };
+        let (tx, mut wake) = watch::channel(0);
+        let mut child = spawn();
+        // Checks are an hour apart, so only the wake can run one.
+        let run = supervise(&mut child, Duration::from_secs(3600), &mut wake, || async { Check::Down("gone".into()) });
+        let started = tokio::time::Instant::now();
+        let (why, ()) = tokio::join!(run, async { tx.send_modify(|n| *n += 1) });
+        assert!(why.unwrap().starts_with("stopped after 1 failed checks"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.try_wait().unwrap().is_some());
+
+        // A wake cuts the wait before a new start short, and the backoff starts again.
+        let (tx, mut wake) = watch::channel(0);
+        let napping = nap(Duration::from_secs(3600), &mut wake);
+        let (next, ()) = tokio::join!(napping, async { tx.send_modify(|n| *n += 1) });
+        assert_eq!(next, Duration::from_secs(1));
+        let (_tx, mut quiet) = watch::channel(0);
+        assert_eq!(nap(Duration::from_millis(5), &mut quiet).await, Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn the_relay_check_reads_the_status_through_the_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serve = |status: &'static str| {
+            let listener = &listener;
+            async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let n = s.read(&mut buf).await.unwrap();
+                assert!(buf[..n].starts_with(b"GET /healthz HTTP/1.1"));
+                s.write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        };
+        let (check, ()) = tokio::join!(relay_answers(port), serve("200 OK"));
+        assert!(matches!(check, Check::Alive));
+        let (check, ()) = tokio::join!(relay_answers(port), serve("502 Bad Gateway"));
+        assert!(matches!(check, Check::Down(e) if e.contains("502")));
+        drop(listener);
+        assert!(matches!(relay_answers(port).await, Check::Down(_)));
+        assert_eq!(status_of(b"HTTP/1.1 204 No Content\r\n"), Some(204));
+        assert_eq!(status_of(b"SSH-2.0-x\r\n"), None);
+    }
+
+    #[test]
+    fn a_mesh_tunnel_names_its_machine_by_label() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(machine_label(&l(&["imesh", "imesh-26c8e8a90c"])), Some("26c8e8a90c"));
+        assert_eq!(machine_label(&l(&["imesh", "imesh-win"])), None);
+        assert_eq!(machine_label(&l(&["imesh-26C8E8A90C"])), None);
+        assert_eq!(machine_label(&l(&["imesh"])), None);
     }
 
     #[test]

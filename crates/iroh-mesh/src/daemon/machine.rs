@@ -76,6 +76,8 @@ pub struct Inner {
     pub(crate) exposed: tokio::sync::watch::Sender<Option<net::devtunnel::Hosted>>,
     /// The forwards of other members' tunnels.
     pub(crate) mesh: super::mesh::Mesh,
+    /// Counts wakes from sleep and network changes (see `wake.rs`).
+    pub(crate) wake: tokio::sync::watch::Sender<u64>,
 
     // Lifecycle.
     /// Set by `machine.reset`. [`Running::reset_requested`] waits for it.
@@ -250,8 +252,9 @@ impl Machine {
                 port,
                 self.id(),
                 self.name().to_string(),
-                r.devtunnel_cli.clone(),
+                self.mesh.cli().clone(),
                 self.exposed.clone(),
+                self.wake.subscribe(),
             )
         });
         Ok((Some(server), tunnel))
@@ -313,6 +316,9 @@ impl Machine {
             want.insert(h.url.clone(), None);
         }
         for (_, url) in self.mesh.ready_urls() {
+            want.insert(url, None);
+        }
+        for url in self.mesh.extra_urls() {
             want.insert(url, None);
         }
         self.set_relays(want).await;
@@ -405,7 +411,7 @@ impl Machine {
         // Every relay this machine reaches, not only the peer's own: the peer is a client of one of
         // them, and which one changes when a relay goes down. A URL here names a relay by this
         // machine's own forward, so it is no use to another machine.
-        let forwarded = self.mesh.ready_urls().into_iter().map(|(_, url)| url);
+        let forwarded = self.mesh.ready_urls().into_iter().map(|(_, url)| url).chain(self.mesh.extra_urls());
         let relays = mine.into_iter().chain(cluster).chain(forwarded).map(iroh::TransportAddr::Relay);
         EndpointAddr::from_parts(id, addrs.into_iter().chain(relays))
     }
@@ -581,15 +587,47 @@ impl Machine {
     /// or the join ends.
     fn reconcile_mesh(&self, snap: &Snapshot) {
         let me = self.id();
+        // A member's tunnel that `devtunnel list` shows hosted wins over a stale one in its row.
         let want: BTreeMap<EndpointId, crate::state::TunnelEndpoint> = snap
             .machines
             .iter()
             .filter(|(id, _)| **id != me)
-            .filter_map(|(id, m)| Some((*id, m.tunnel.clone()?)))
+            .filter_map(|(id, m)| Some((*id, self.mesh.endpoint_for(id, m.tunnel.as_ref())?)))
             .collect();
         self.mesh.reconcile(&want);
+        self.mesh.reconcile_extra(&me);
+    }
+
+    /// In the devtunnel mesh: lists the hosted mesh tunnels of this devtunnel login now, then
+    /// every [`LIST_EVERY`] and after each wake, for [`super::mesh::Mesh::set_listed`]. A failed
+    /// list keeps the last one.
+    pub(super) async fn list_tunnels(self) {
+        let me = self.id().fmt_short().to_string();
+        let mut wake = self.wake.subscribe();
+        let mut ports = BTreeMap::new();
+        loop {
+            match net::devtunnel::list_hosted(self.mesh.cli().path(), &me, &mut ports).await {
+                Ok(found) => {
+                    let mut by: BTreeMap<String, Vec<crate::state::TunnelEndpoint>> = BTreeMap::new();
+                    for (short, e) in found {
+                        by.entry(short).or_default().push(e);
+                    }
+                    debug!(machines = by.len(), "devtunnel list: hosted mesh tunnels");
+                    self.mesh.set_listed(by);
+                }
+                Err(e) => debug!("devtunnel list: {e:#}"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(LIST_EVERY) => {}
+                // A wake: a short pause first, so the hosts that also woke are back in the list.
+                _ = wake.changed() => tokio::time::sleep(Duration::from_secs(5)).await,
+            }
+        }
     }
 }
+
+/// How often a machine in the devtunnel mesh lists its login's hosted mesh tunnels.
+const LIST_EVERY: Duration = Duration::from_secs(120);
 
 fn loopback(url: &iroh::RelayUrl) -> bool {
     url.host_str().is_some_and(|h| {

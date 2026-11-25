@@ -320,3 +320,53 @@ fn user_of(process: HANDLE) -> Result<Vec<u64>> {
     ensure!(ok != 0, "read a process token: {err}");
     Ok(buf)
 }
+
+pub fn end_with_parent(_: &mut tokio::process::Command) {}
+
+/// Puts `child` in this process's job for children: a job that ends every process in it when its
+/// last handle closes, which is when this process ends, by a crash or a kill too. Best effort: a
+/// child that cannot join it is stopped only when dropped.
+pub fn adopt_child(child: &tokio::process::Child) {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    static JOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: plain calls on a handle this process owns and keeps open for its whole life.
+    let job = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return 0;
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set == 0 {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+            return 0;
+        }
+        job as usize
+    });
+    if job == 0 {
+        return;
+    }
+    if let Some(h) = child.raw_handle() {
+        // SAFETY: `h` is the child's process handle, open while `child` lives.
+        unsafe {
+            AssignProcessToJobObject(job as windows_sys::Win32::Foundation::HANDLE, h as _);
+        }
+    }
+}
+
+/// The unbiased interrupt time: time since boot without the time in sleep or hibernation.
+pub fn awake_time() -> std::time::Duration {
+    let mut t = 0u64;
+    // SAFETY: writes one u64 that lives on this stack.
+    unsafe { windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&mut t) };
+    std::time::Duration::from_nanos(t.saturating_mul(100))
+}

@@ -8,7 +8,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 async fn main() -> Result<()> {
     let tunnel: iroh_mesh::net::DevTunnel =
         std::env::args().nth(1).context("expected devtunnel:<id>:<port>")?.parse()?;
-    let child = tunnel.start(None).await?;
+    // No wakes here: the forward is checked on its own schedule only.
+    let (_wakes, wake) = tokio::sync::watch::channel(0);
+    let child = tunnel.start(None, wake).await?;
     println!("forwarding started");
     let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, tunnel.port)).await?;
     println!("local TCP connected");
