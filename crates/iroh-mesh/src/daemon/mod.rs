@@ -220,9 +220,14 @@ async fn bind_endpoint(
 ) -> Result<iroh::Endpoint> {
     let mut b = net::endpoint_builder(net.n0, relays, net.relay_ca.as_deref(), net.proxy.as_ref())?;
     if net.relay_only {
-        b = b.clear_ip_transports();
+        b = b.clear_ip_transports().portmapper_config(iroh::endpoint::PortmapperConfig::Disabled);
     } else if let Some(addr) = net.bind {
         b = b.clear_ip_transports().bind_addr(addr).context("bind the iroh endpoint")?;
+        // A router can't map a loopback port, and asking it reaches the local network, which makes
+        // macOS ask for Local Network access.
+        if addr.ip().is_loopback() {
+            b = b.portmapper_config(iroh::endpoint::PortmapperConfig::Disabled);
+        }
     }
     if let Some(url) = &net.pkarr {
         b = b
