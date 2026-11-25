@@ -224,6 +224,11 @@ pub struct NetArgs {
     /// Also find machines on the same LAN with mDNS.
     #[arg(long, env = "IMESH_MDNS", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     pub mdns: Option<bool>,
+    /// Ask the router to open a port for this machine (UPnP, PCP, NAT-PMP), as iroh does by
+    /// default. `--portmapper=false` turns it off: it probes the local network, and macOS asks
+    /// for Local Network access for it.
+    #[arg(long, env = "IMESH_PORTMAPPER", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub portmapper: Option<bool>,
     /// Open no UDP port: every connection goes out to a relay over HTTPS, and nothing listens for
     /// iroh here. Slower; use your own relay (--relay) for real traffic.
     #[arg(long, env = "IMESH_RELAY_ONLY", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -272,6 +277,11 @@ impl NetArgs {
             devtunnel_mesh: self.has(&Relay::DevTunnel),
             pkarr: self.pkarr.clone(),
             mdns: self.mdns == Some(true),
+            portmapper: if self.portmapper == Some(false) {
+                iroh::endpoint::PortmapperConfig::Disabled
+            } else {
+                Default::default()
+            },
             serve_relay: self.serve_relay,
             serve_relay_token: self.serve_relay_token.clone(),
             serve_relay_tls: self.serve_relay_cert.clone().zip(self.serve_relay_key.clone()),
@@ -320,6 +330,7 @@ impl NetArgs {
         set("IMESH_RELAY_CA", path(&self.relay_ca));
         set("IMESH_PKARR", self.pkarr.as_ref().map(|u| u.to_string()));
         set("IMESH_MDNS", (self.mdns == Some(true)).then(|| "true".into()));
+        set("IMESH_PORTMAPPER", self.portmapper.map(|v| v.to_string()));
         set("IMESH_RELAY_ONLY", (self.relay_only == Some(true)).then(|| "true".into()));
         set("IMESH_SERVE_RELAY", self.serve_relay.map(|a| a.to_string()));
         set("IMESH_SERVE_RELAY_TOKEN", self.serve_relay_token.clone());

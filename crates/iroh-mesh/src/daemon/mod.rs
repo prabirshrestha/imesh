@@ -219,6 +219,7 @@ async fn bind_endpoint(
     admission: &Admission,
 ) -> Result<iroh::Endpoint> {
     let mut b = net::endpoint_builder(net.n0, relays, net.relay_ca.as_deref(), net.proxy.as_ref())?;
+    b = b.portmapper_config(net.portmapper.clone());
     if net.relay_only {
         b = b.clear_ip_transports();
     } else if let Some(addr) = net.bind {
